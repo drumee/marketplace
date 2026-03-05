@@ -1,0 +1,35 @@
+{
+  "name": "@drumee/loby",
+  "version": "0.0.0",
+  "description": "Signin + Signup + onborading",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "drumee-server-deploy",
+    "dev": "drumee-server-devel",
+    "register-plugin": "drumee-server-plugin add",
+    "remove-plugin": "drumee-server-plugin remove",
+    "release": "git push && npm publish --access public && npm version patch",
+    "send-beta-email": "node emailing/scripts/send-beta-announcement.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:drumee/analytics-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/drumee/analytics-server/issues"
+  },
+  "author": "Somanos Sar <somanos@drumee.com>",
+  "license": "APACHE V2",
+  "dependencies": {
+    "@drumee/server-core": "^1.1.49",
+    "@drumee/server-essentials": "^1.2.15",
+    "argparse": "^2.0.1",
+    "axios": "^1.13.2",
+    "jsonfile": "^6.2.0",
+    "jsonwebtoken": "^9.0.2",
+    "lodash": "^4.17.21"
+  },
+  "devDependencies": {
+    "@drumee/server-dev-tools": "^1.1.29"
+  }
+}

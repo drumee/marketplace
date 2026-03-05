@@ -1,0 +1,19 @@
+version: '3'
+services:
+  onlyoffice:
+    image: onlyoffice/documentserver-de:latest
+    container_name: onlyoffice-documentserver
+    restart: always
+    ports:
+      - "4443:443"
+      - "8080:80"  # Optional, for redirect
+    volumes:
+      - /srv/oo/DocumentServer/logs:/var/log/onlyoffice
+      - /srv/oo/DocumentServer/data:/var/www/onlyoffice/Data
+      - /srv/oo/DocumentServer/lib:/var/lib/onlyoffice
+      - /srv/oo/DocumentServer/db:/var/lib/postgresql
+      - /data/mfs:/data/mfs:ro
+      - /opt/acme/certs/oo.drumee.io_ecc/:/var/www/onlyoffice/Data/certs:ro
+    environment:
+      - JWT_ENABLED=true
+      - JWT_SECRET=${JWT_SECRET}

@@ -1,0 +1,81 @@
+{
+  "services": {
+    "html": {
+      "doc": "Send a html page with preset to load document using onlyoffice document server",
+      "scope": "hub",
+      "permission": {
+        "src": "read"
+      },
+      "params": {
+        "nid": {
+          "type": "string",
+          "required": true,
+          "doc": "File node id."
+        },
+        "hub_id": {
+          "type": "string",
+          "required": true,
+          "doc": "File hub id."
+        }
+      },
+      "returns": {
+        "type": "octet/stream",
+        "doc": "Render the templates/index.html with data required by the onlyoffice document server."
+      },
+      "errors": [
+        { "code": "PERMISSION_DENIED", "message": "Permission denied", "http_status": 401 }
+      ]
+    },
+    "read": {
+      "doc": "Send requested file content. Permission intentionally set to anonymous because it's sent by third party. The permission control relies on the the method onlyoffice.html",
+      "scope": "hub",
+      "permission": {
+        "src": "anonymous",
+        "fast_check": "public-api"
+      },
+      "params": {
+        "uid": {
+          "type": "string",
+          "required": true,
+          "doc": "The user id requesting the access"
+        },
+        "nid": {
+          "type": "string",
+          "required": true,
+          "doc": "File node id."
+        },
+        "hub_id": {
+          "type": "string",
+          "required": true,
+          "doc": "File hub id."
+        },
+        "sessionKey": {
+          "type": "string",
+          "required": true,
+          "doc": "Unique identifier used by Onlyoffice."
+        },
+        "signature": {
+          "type": "string",
+          "required": true,
+          "doc": "Signature to ensure that the request has not been altered."
+        }
+      },
+      "returns": {
+        "type": "octet/stream",
+        "doc": "File content"
+      }
+    },
+    "write": {
+      "doc": "Initiates OnlyOffice authorization flow.",
+      "scope": "hub",
+      "permission": {
+        "src": "anonymous",
+        "fast_check": "public-api"
+      }
+    }
+  },
+  "modules": {
+    "private": "service/index",
+    "public": "service/index"
+  }
+}
