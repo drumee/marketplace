@@ -1,6 +1,6 @@
 const { resolve } = require('path');
 const { Mfs } = require('@drumee/server-core');
-const { sysEnv, Attr, Permission, Constants } = require('@drumee/server-essentials');
+const { Cache, sysEnv, Attr, Permission, Constants, getFileinfo } = require('@drumee/server-essentials');
 const { template } = require('lodash');
 const Jwt = require('jsonwebtoken'); // Make sure this is installed
 
@@ -10,6 +10,7 @@ const { readFileSync } = require('jsonfile');
 const { onlyoffice: oo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
+  FILESIZE
 } = Constants;
 
 class OnlyOffice extends Mfs {
@@ -103,17 +104,15 @@ class OnlyOffice extends Mfs {
    * @param {*} sessionKey 
    * @returns 
    */
-  async read() {
+  async checkSanity() {
     const authHeader = this.input.headers()['authorization'];
     const token = authHeader.substring(7);
-    this.debug("AAA:90", token)
     try {
       // Verify the token and extract payload
       const decoded = Jwt.verify(token, oo_secret);
       let p = new URL(decoded.payload.url).searchParams
-      // The token payload contains the URL being requested
-      // You can log or validate against this URL
-      console.log('Token payload:', p);
+
+      // Extract parameters from token payload
       let uid = p.get(Attr.uid)
       let nid = p.get(Attr.nid)
       let hub_id = p.get(Attr.hub_id)
@@ -123,25 +122,175 @@ class OnlyOffice extends Mfs {
         .createHmac('sha256', drumee_secret)
         .update(args)
         .digest('hex');
-      // Extract session info if available in token
-      this.debug("AAA122", args, signature, p.get('signature'))
+      // Check signature to ensure URL integrity
       if (!p.get('signature') || p.get('signature') != signature) {
-        console.error('Invalid signature', p, args);
+        this.warn('Invalid signature', p, args);
         return this.exception.unauthorized("Permission denied")
       }
       const db_name = await this.yp.await_func("get_db_name", hub_id)
       let node = await this.yp.await_proc(`${db_name}.mfs_access_node`, uid, nid);
-      this.debug("AAAA:1313", node)
       if (node.privilege & Permission.read) {
-        await this.send_media(node, ORIGINAL);
-      }else{
-        return this.exception.unauthorized("Permission denied")
+        return { ...node, uid, nid, hub_id, sessionKey };
       }
+      this.exception.unauthorized("Permission denied")
+      return false
+
     } catch (jwtError) {
-      console.error('JWT validation failed:', jwtError.message);
-      return this.exception.unauthorized("Invalid authorization token")
+      this.warn('JWT validation failed:', jwtError.message);
+      this.exception.unauthorized("Invalid authorization token")
+      return false;
     }
   }
+
+  /**
+   * 
+   * @param {*} sessionKey 
+   * @returns 
+   */
+  async read() {
+    const node = await this.checkSanity();
+    if (!node) return;
+    await this.send_media(node, ORIGINAL);
+  }
+
+
+  /**
+ * replace existing media by uploaded file
+ * @param {*} nid 
+ * @param {*} incoming_file 
+ * @param {*} filename 
+ * @returns 
+ */
+  async replace(nid, incoming_file, filename) {
+    let node = this.granted_node();
+    if (/^(folder|root)$/.test(node.filetype)) {
+      this.warn("COULD NOT REPLACE FOLDER", this.input.use(Attr.filepath), node);
+      this.exception.user("TARGET_IS_FOLDER_OR_ROOT");
+      return;
+    }
+    let md5Hash = this.input.get("md5Hash");
+    let { metadata } = node;
+    metadata = this.cleanJson(metadata);
+    metadata.md5Hash = md5Hash;
+    let privilege = node.permission;
+    let home_dir = node.home_dir;
+    let mfs_root = node.mfs_root;
+    let data = await this.before_store(incoming_file, filename, {
+      nid: node.parent_id,
+    });
+    data.rtime = Math.floor(new Date().getTime() / 1000);
+    data.publish_time = data.rtime;
+    if (data.filename) {
+      data.user_filename = data.filename.replace(`.${data.extension}`, "");
+    }
+
+    await this.db.await_proc("mfs_set_node_attr", nid, data, 0);
+    await this.db.await_proc("mfs_set_metadata", nid, metadata, 0);
+    node.metadata = metadata;
+    await this.after_store(
+      node.pid,
+      incoming_file,
+      { ...node, privilege, home_dir, mfs_root, md5Hash },
+    );
+    node = await this.db.await_proc("mfs_access_node", this.uid, nid);
+    if (node.filetype == Attr.document) {
+      Document.rebuildInfo(
+        node,
+        this.uid,
+        this.input.get(Attr.socket_id)
+      )
+    }
+    this.output.data({
+      ...node,
+      replace: 1,
+    });
+  }
+
+  /**
+ * 
+ * @param {*} incoming_file 
+ * @param {*} data 
+ * @returns 
+ */
+  async after_store(pid, incoming_file, data) {
+    const base = resolve(data.mfs_root, data.id);
+    mkdirSync(base, { recursive: true });
+    const ext = data.extension.toLowerCase();
+    let orig = `${base}/orig.${ext}`;
+    this.granted_node(data);
+    if (data.filetype == Attr.document && data.extension != Attr.pdf) {
+      if (!this.handlePdf(incoming_file, data)) {
+        data.error = 1;
+      }
+      return data;
+    }
+    if (data.filetype == Attr.form) {
+      let content = await this.handleForm(pid, incoming_file, data);
+      return content;
+    }
+
+    if (!mv(incoming_file, orig) || !existsSync(orig)) {
+      this.warn(`${__filename}:337 ${orig} not found`);
+      this.exception.user(FAILED_CREATE_FILE);
+      return { ...data, error: 1 };
+    }
+
+    // Force information generation
+    if (data.filetype == Attr.document && data.extension == Attr.pdf) {
+      Document.getInfo(data);
+    }
+
+    data.position = this.input.get(Attr.position) || 0;
+
+    return data;
+  }
+
+  /**
+* Preapre data for storage
+* @param {*} incoming_file 
+* @param {*} filename 
+* @param {*} parent 
+* @returns 
+*/
+  async store(node) {
+    const incoming_file = this.input.need(Attr.uploaded_file)
+    if (!existsSync(incoming_file)) {
+      return this.output.data({ error: "Uploaded file not found" });
+    }
+
+    if (node.filetype !== Attr.document) {
+      this.warn("TARGET IS NOT A DOCUMENT", this.input.use(Attr.filepath), node);
+      this.output.data({ error: "File type is not supported" });
+      return;
+    }
+
+    let md5Hash = this.input.get("md5Hash");
+    let { metadata } = node;
+    metadata = this.cleanJson(metadata);
+    metadata.md5Hash = md5Hash;
+    node.publish_time = Math.floor(new Date().getTime() / 1000);;
+
+    node.metadata = metadata;
+    await this.db.await_proc("mfs_set_node_attr", node.id, node, 0);
+    await this.db.await_proc("mfs_set_metadata", node.id, metadata, 0);
+    Document.rebuildInfo(
+      node,
+      this.uid,
+      this.input.get(Attr.socket_id)
+    )
+  }
+
+  /**
+   * 
+   * @param {*} sessionKey 
+   * @returns 
+   */
+  async write() {
+    const node = await this.checkSanity();
+    await this.store(node);
+    if (!node) return;
+  }
+
 
 
   /**
@@ -208,7 +357,7 @@ class OnlyOffice extends Mfs {
 
       ctx.body = { error: 0 };
     } catch (error) {
-      console.error('Callback error:', error);
+      this.warn('Callback error:', error);
       ctx.body = { error: 1, message: error.message };
     }
   }
