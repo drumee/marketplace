@@ -65,7 +65,15 @@
         "doc": "File content"
       }
     },
-    "write": {
+    "callback": {
+      "doc": "Initiates OnlyOffice authorization flow.",
+      "scope": "hub",
+      "permission": {
+        "src": "anonymous",
+        "fast_check": "public-api"
+      }
+    },
+    "test": {
       "doc": "Initiates OnlyOffice authorization flow.",
       "scope": "hub",
       "permission": {

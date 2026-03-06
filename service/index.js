@@ -1,17 +1,32 @@
 const { resolve } = require('path');
-const { Mfs } = require('@drumee/server-core');
-const { Cache, sysEnv, Attr, Permission, Constants, getFileinfo } = require('@drumee/server-essentials');
+const {
+  RedisStore, sysEnv, Attr, Permission, Constants, Network, toArray
+} = require('@drumee/server-essentials');
 const { template } = require('lodash');
 const Jwt = require('jsonwebtoken'); // Make sure this is installed
+const {
+  Generator,
+  Document,
+  FileIo,
+  Mfs,
+  MfsTools,
+} = require("@drumee/server-core");
 
-const { credential_dir } = sysEnv();
+const { credential_dir, server_home } = sysEnv();
+const OFFLINE_DIR = resolve(server_home, "offline", "media");
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
-const { readFileSync } = require('jsonfile');
+const { readFileSync, writeFileSync } = require('jsonfile');
 const { onlyoffice: oo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
-  FILESIZE
 } = Constants;
+
+const {
+  mkdirSync,
+  readFileSync: readFile,
+  existsSync,
+} = require("fs");
+const { mv, cleanSeen } = MfsTools;
 
 class OnlyOffice extends Mfs {
 
@@ -20,9 +35,8 @@ class OnlyOffice extends Mfs {
  */
   async sendHtml(data) {
     const { main_domain } = sysEnv()
-    const { readFileSync } = require('fs');
     const tpl = resolve(__dirname, 'templates/index.html');
-    let html = readFileSync(tpl);
+    let html = readFile(tpl);
     html = String(html).trim().toString();
     const content = template(html)(data);
 
@@ -35,19 +49,19 @@ class OnlyOffice extends Mfs {
    * 
    */
   async html() {
-    const nid = this.input.get(Attr.nid)
     const uid = this.uid;
-    const hub_id = this.input.get(Attr.hub_id)
-    const socket_id = this.input.get(Attr.socket_id)
-    const { filename, extension, privilege } = this.granted_node();
-
+    const { hub_id, nid, filename, extension, privilege } = this.granted_node();
 
     // Generate unique session key
-    const sessionKey = `${nid}_${Date.now()}`;
+    // Store the node as pre-authorized for future access based on sessionKey
+    const sessionKey = this.randomString();
+    let args = { sessionKey, hub_id, nid, uid: uid, expiry: 36000 };
+    await this.yp.await_proc('mfs_add_autorized_node', args);
 
-    // Generate signed URLs for ONLYOFFICE
-    const documentUrl = this.generateSignedUrl(nid, hub_id, sessionKey);
-    const callbackUrl = this.generateSignedUrl(nid, hub_id, sessionKey, 'write');
+    // Sign the sessionKey to ensure with wonn't be forged
+    const signature = this.signString(sessionKey);
+
+    let query = `signature=${signature}&sessionKey=${sessionKey}`;
 
     // Get user info
     const firstname = await this.user.get(Attr.firstname);
@@ -58,16 +72,23 @@ class OnlyOffice extends Mfs {
         fileType: extension,
         key: sessionKey,
         title: filename,
-        url: documentUrl,
-        documentType: "word"
+        url: `${this.input.homepath()}svc/onlyoffice.read?${query}`
       },
       editorConfig: {
         mode: privilege & Permission.write ? 'edit' : 'view',
-        callbackUrl: callbackUrl,
+        callbackUrl: `${this.input.homepath()}svc/onlyoffice.callback?key=${sessionKey}`,
         user: {
           id: uid,
           name: firstname
         }
+      },
+      customization: {
+        forcesave: true,  // Enable Save button and intermediate versions
+      },
+      // Your custom Drumee data
+      drumeeContext: {
+        nid,
+        hub_id
       },
       documentServerUrl: 'https://oo.drumee.io'
     };
@@ -91,12 +112,11 @@ class OnlyOffice extends Mfs {
    * @param {*} sessionKey 
    * @returns 
    */
-  generateSignedUrl(nid, hub_id, sessionKey, method = 'read') {
-    const signature = require('crypto')
+  signString(query) {
+    return require('crypto')
       .createHmac('sha256', drumee_secret)
-      .update(`${this.uid}:${nid}:${hub_id}:${sessionKey}`)
+      .update(query)
       .digest('hex');
-    return `${this.input.homepath()}svc/onlyoffice.${method}?uid=${this.uid}&nid=${nid}&hub_id=${hub_id}&sessionKey=${sessionKey}&signature=${signature}`;
   }
 
   /**
@@ -104,41 +124,18 @@ class OnlyOffice extends Mfs {
    * @param {*} sessionKey 
    * @returns 
    */
-  async checkSanity() {
+  extractContent() {
     const authHeader = this.input.headers()['authorization'];
     const token = authHeader.substring(7);
     try {
       // Verify the token and extract payload
       const decoded = Jwt.verify(token, oo_secret);
-      let p = new URL(decoded.payload.url).searchParams
-
-      // Extract parameters from token payload
-      let uid = p.get(Attr.uid)
-      let nid = p.get(Attr.nid)
-      let hub_id = p.get(Attr.hub_id)
-      let sessionKey = p.get('sessionKey')
-      let args = `${uid}:${nid}:${hub_id}:${sessionKey}`;
-      const signature = require('crypto')
-        .createHmac('sha256', drumee_secret)
-        .update(args)
-        .digest('hex');
-      // Check signature to ensure URL integrity
-      if (!p.get('signature') || p.get('signature') != signature) {
-        this.warn('Invalid signature', p, args);
-        return this.exception.unauthorized("Permission denied")
-      }
-      const db_name = await this.yp.await_func("get_db_name", hub_id)
-      let node = await this.yp.await_proc(`${db_name}.mfs_access_node`, uid, nid);
-      if (node.privilege & Permission.read) {
-        return { ...node, uid, nid, hub_id, sessionKey };
-      }
-      this.exception.unauthorized("Permission denied")
-      return false
+      return new URL(decoded.payload.url).searchParams
 
     } catch (jwtError) {
-      this.warn('JWT validation failed:', jwtError.message);
+      this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
       this.exception.unauthorized("Invalid authorization token")
-      return false;
+      return {};
     }
   }
 
@@ -148,11 +145,212 @@ class OnlyOffice extends Mfs {
    * @returns 
    */
   async read() {
-    const node = await this.checkSanity();
-    if (!node) return;
-    await this.send_media(node, ORIGINAL);
+    const authHeader = this.input.headers()['authorization'];
+    const token = authHeader.substring(7);
+    try {
+      // Verify the token and extract payload
+      const decoded = Jwt.verify(token, oo_secret);
+      let p = new URL(decoded.payload.url).searchParams
+      // Extract parameters from token payload
+      const sessionKey = p.get('sessionKey')
+      const signature = require('crypto')
+        .createHmac('sha256', drumee_secret)
+        .update(sessionKey)
+        .digest('hex');
+
+      // Check signature to ensure URL integrity
+      if (!p.get('signature') || p.get('signature') != signature) {
+        this.warn('Invalid signature', signature, p, decoded.payload.url);
+        return this.exception.unauthorized("Permission denied")
+      }
+
+      let node = await this.yp.await_proc(`mfs_get_autorized_node`, sessionKey);
+      if (!node.length) {
+        this.warn('Node info not found');
+        return this.exception.unauthorized("Permission denied")
+      }
+      if (node[0].privilege & Permission.read) {
+        await this.send_media(node[0], ORIGINAL);
+        return;
+      }
+      this.exception.unauthorized("Permission denied")
+
+    } catch (jwtError) {
+      this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
+      this.exception.unauthorized("Invalid authorization token")
+    }
+
   }
 
+  /**
+   * 
+   * @param {*} args 
+   */
+  async sendNodeAttributes(node) {
+    let recipients = await this.yp.await_proc("entity_sockets", {
+      hub_id: node.hub_id,
+    });
+    let payload = this.payload(node, { service: "media.replace" });
+    for (let r of toArray(recipients)) {
+      await RedisStore.sendData(payload, r);
+    }
+  }
+
+
+
+  /**
+  *
+  * @param {*} dir
+  * @param {*} filter
+  */
+  async importFile(node, ctx) {
+    if (!node) {
+      this.warn("importFile failed. Node not found");
+      return
+    }
+    const base = resolve(node.home_dir, node.nid)
+    const outfile = resolve(base, `orig.${node.ext}`)
+    this.debug(`Downloading ${this.input.get(Attr.url)} => ${outfile}.`);
+    let opt = {
+      method: 'GET',
+      outfile,
+      url: this.input.get(Attr.url),
+    };
+    let res = await Network.request(opt);
+    let { md5Hash } = res;
+    let metadata = {};
+    if (node.metadata) {
+      metadata = cleanSeen(node.metadata);
+    }
+    node.publish_time = Math.floor(res.mtimeMs / 1000);
+    res.filesize = res.size;
+    metadata.md5Hash = md5Hash;
+    this.debug("AAA:204", res)
+    const { db_name, uid } = ctx;
+    await this.yp.await_proc(`${db_name}.mfs_set_node_attr`, node.id, node, 0);
+    await this.yp.await_proc(`${db_name}.mfs_set_metadata`, node.id, metadata, 0);
+    Document.rebuildInfo(
+      node,
+      uid,
+      this.input.get(Attr.socket_id)
+    );
+    await this.sendNodeAttributes(node)
+  }
+
+  /**
+   * Callback endpoint from onlyoffice
+   * Always return 200 with {error: 0} to acknowledge receipt
+   * @param {*} sessionKey 
+   * @returns 
+   */
+  async callback() {
+    try {
+      Jwt.verify(this.input.get(Attr.token), oo_secret);
+    } catch (jwtError) {
+      this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
+      this.exception.unauthorized("Invalid authorization token")
+      return
+    }
+
+    switch (this.input.get(Attr.status)) {
+      case 6: // MustForceSave (force save during editing)
+      case 2: // MustSave (normal save after closing)
+        let node = await this.yp.await_proc(`mfs_get_autorized_node`, this.input.get(Attr.key)) || [];
+        this.debug("AAA:201", node)
+        if (this.input.get(Attr.url)) {
+          await this.importFile(...node);
+        }
+        break;
+
+      case 3: // Corrupted (error during save)
+      case 7: // Force save error
+        this.warn('Document save error:', callbackData);
+        // Log error but still acknowledge
+        break;
+
+      case 4: // Closed with no changes
+        this.debug('Document closed with no changes');
+        break;
+
+      case 1: // Editing in progress
+        // Just acknowledge, no action needed
+        break;
+
+      default:
+        this.debug('Unhandled status:', callbackData.status);
+
+    }
+    this.output.json({ error: 0 })
+  }
+
+  /**
+  * Preapre data for storage
+  * @param {*} incoming_file 
+  * @param {*} filename 
+  * @param {*} parent 
+  * @returns 
+  */
+  async store(node) {
+    const incoming_file = this.input.need(Attr.uploaded_file)
+    if (!existsSync(incoming_file)) {
+      return this.output.data({ error: "Uploaded file not found" });
+    }
+
+    if (node.filetype !== Attr.document) {
+      this.warn("TARGET IS NOT A DOCUMENT", this.input.use(Attr.filepath), node);
+      this.output.data({ error: "File type is not supported" });
+      return;
+    }
+    if (!this.import(incoming_file, node)) {
+      this.output.data({ error: "Failed to import" });
+      return
+    }
+    let md5Hash = this.input.get("md5Hash");
+    let { metadata } = node;
+    metadata = this.cleanJson(metadata);
+    metadata.md5Hash = md5Hash;
+    node.publish_time = Math.floor(new Date().getTime() / 1000);;
+
+    node.metadata = metadata;
+    await this.db.await_proc("mfs_set_node_attr", node.id, node, 0);
+    await this.db.await_proc("mfs_set_metadata", node.id, metadata, 0);
+    Document.rebuildInfo(
+      node,
+      this.uid,
+      this.input.get(Attr.socket_id)
+    );
+  }
+
+
+  /**
+   *
+   * @param {*} node
+   */
+  import(incoming_file, node) {
+    const base = resolve(node.mfs_root, node.id);
+    const ext = node.extension.toLowerCase();
+    let orig = join(base, `orig.${ext}`);
+    let info = join(base, "info.json");
+    mkdirSync(base, { recursive: true });
+    let docInfo = { buildState: Attr.working };
+    if (!mv(incoming_file, orig)) {
+      this.exception.server('FILE_ERROR');
+      return false
+    }
+    rmSync(info, { force: true });
+    writeFileSync(info, docInfo);
+    let socket_id = this.input.get(Attr.socket_id);
+    let args = {
+      node,
+      uid: this.uid,
+      socket_id,
+    };
+
+    let cmd = resolve(OFFLINE_DIR, "to-pdf.js");
+    let child = Spawn(cmd, [JSON.stringify(args)], SPAWN_OPT);
+    child.unref();
+    return true
+  }
 
   /**
  * replace existing media by uploaded file
@@ -224,10 +422,6 @@ class OnlyOffice extends Mfs {
       }
       return data;
     }
-    if (data.filetype == Attr.form) {
-      let content = await this.handleForm(pid, incoming_file, data);
-      return content;
-    }
 
     if (!mv(incoming_file, orig) || !existsSync(orig)) {
       this.warn(`${__filename}:337 ${orig} not found`);
@@ -243,52 +437,6 @@ class OnlyOffice extends Mfs {
     data.position = this.input.get(Attr.position) || 0;
 
     return data;
-  }
-
-  /**
-* Preapre data for storage
-* @param {*} incoming_file 
-* @param {*} filename 
-* @param {*} parent 
-* @returns 
-*/
-  async store(node) {
-    const incoming_file = this.input.need(Attr.uploaded_file)
-    if (!existsSync(incoming_file)) {
-      return this.output.data({ error: "Uploaded file not found" });
-    }
-
-    if (node.filetype !== Attr.document) {
-      this.warn("TARGET IS NOT A DOCUMENT", this.input.use(Attr.filepath), node);
-      this.output.data({ error: "File type is not supported" });
-      return;
-    }
-
-    let md5Hash = this.input.get("md5Hash");
-    let { metadata } = node;
-    metadata = this.cleanJson(metadata);
-    metadata.md5Hash = md5Hash;
-    node.publish_time = Math.floor(new Date().getTime() / 1000);;
-
-    node.metadata = metadata;
-    await this.db.await_proc("mfs_set_node_attr", node.id, node, 0);
-    await this.db.await_proc("mfs_set_metadata", node.id, metadata, 0);
-    Document.rebuildInfo(
-      node,
-      this.uid,
-      this.input.get(Attr.socket_id)
-    )
-  }
-
-  /**
-   * 
-   * @param {*} sessionKey 
-   * @returns 
-   */
-  async write() {
-    const node = await this.checkSanity();
-    await this.store(node);
-    if (!node) return;
   }
 
 
@@ -361,6 +509,91 @@ class OnlyOffice extends Mfs {
       ctx.body = { error: 1, message: error.message };
     }
   }
+
+  /**
+   * 
+   */
+  test() {
+    this.debug('AAA:402', this.granted_node(), this.randomString(), OFFLINE_DIR)
+  }
 }
 
 module.exports = OnlyOffice;
+
+/**
+ * 
+ 
+// In your Drumee backend callback endpoint
+app.post('/api/onlyoffice/callback', async (req, res) => {
+  try {
+    const { status, url, key } = req.body;
+    
+    this.debug(`Callback received - Status: ${status}, Key: ${key}`);
+    
+    // Always return 200 with {error: 0} to acknowledge receipt
+    // The actual processing should happen asynchronously
+    
+    // For debugging, log what you received
+    if (status === 2 || status === 6) {
+      this.debug(`Document ready to download from: ${url}`);
+      
+      // Start async processing without blocking the response
+      processDocumentSave(url, key).catch(err => {
+        this.warn('Async save failed:', err);
+        // Log error but don't change the response - ONLYOFFICE already got 200
+      });
+    }
+    
+    // IMPORTANT: Respond immediately with success
+    res.json({ error: 0 });
+    
+  } catch (error) {
+    this.warn('Callback handler error:', error);
+    // Still return 200 with error=0? No - if we caught an exception, 
+    // ONLYOFFICE should retry
+    res.status(500).json({ error: 1, message: error.message });
+  }
+});
+
+// Separate async function for actual document saving
+async function processDocumentSave(url, key) {
+  try {
+    // Download the document from the provided URL
+    const response = await fetch(url, {
+      headers: {
+        // If your ONLYOFFICE requires JWT for downloads
+        'Authorization': `Bearer ${process.env.ONLYOFFICE_JWT_SECRET}`
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Download failed: ${response.status}`);
+    }
+    
+    // Get the file as a buffer or stream
+    const fileBuffer = await response.buffer();
+    
+    // Get session info from your database using the key
+    const session = await db.collection('onlyoffice_sessions').findOne({ key });
+    
+    if (!session) {
+      throw new Error(`No session found for key: ${key}`);
+    }
+    
+    // Save to Drumee filesystem
+    await drumee.file.write(session.fileId, fileBuffer, {
+      metadata: {
+        savedBy: session.userId,
+        savedAt: new Date(),
+        version: await getNextVersion(session.fileId)
+      }
+    });
+    
+    this.debug(`Document ${session.fileId} saved successfully`);
+    
+  } catch (error) {
+    this.warn('Async document save failed:', error);
+    // Here you might want to implement retry logic or alerting
+  }
+}
+ **/

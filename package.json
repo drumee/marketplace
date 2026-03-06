@@ -21,8 +21,8 @@
   "author": "Somanos Sar <somanos@drumee.com>",
   "license": "APACHE V2",
   "dependencies": {
-    "@drumee/server-core": "^1.1.49",
-    "@drumee/server-essentials": "^1.2.15",
+    "@drumee/server-core": "^1.1.62",
+    "@drumee/server-essentials": "^1.2.29",
     "argparse": "^2.0.1",
     "axios": "^1.13.2",
     "jsonfile": "^6.2.0",
