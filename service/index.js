@@ -2,29 +2,25 @@ const { resolve } = require('path');
 const {
   RedisStore, sysEnv, Attr, Permission, Constants, Network, toArray, Cache
 } = require('@drumee/server-essentials');
-const { template, isString} = require('lodash');
+const { template, isString } = require('lodash');
 const Jwt = require('jsonwebtoken'); // Make sure this is installed
 const {
   Document,
-  FileIo,
   Mfs,
   MfsTools,
 } = require("@drumee/server-core");
-
+const { cleanSeen } = MfsTools;
 const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
-const { readFileSync, writeFileSync } = require('jsonfile');
+const { readFileSync } = require('jsonfile');
 const { onlyoffice: oo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
 } = Constants;
 
 const {
-  mkdirSync,
   readFileSync: readFile,
-  existsSync,
 } = require("fs");
-const { mv, cleanSeen } = MfsTools;
 
 class OnlyOffice extends Mfs {
 
@@ -221,12 +217,15 @@ class OnlyOffice extends Mfs {
         node.metadata = JSON.parse(node.metadata)
       }
       delete node.metadata._seen_
+      // node.metadata = cleanSeen(node.metadata)
     } else {
       node.metadata = {}
     }
     node.publish_time = Math.floor(res.mtimeMs / 1000);
     node.metadata.md5Hash = md5Hash;
+    node.md5Hash = md5Hash;
     node.filesize = res.size;
+    node.mtime = node.publish_time;
     const { db_name, uid } = ctx;
     await this.yp.await_proc(`${db_name}.mfs_set_node_attr`, node.id, node, 0);
     await this.yp.await_proc(`${db_name}.mfs_set_metadata`, node.id, { md5Hash }, 0);
@@ -257,7 +256,6 @@ class OnlyOffice extends Mfs {
       case 6: // MustForceSave (force save during editing)
       case 2: // MustSave (normal save after closing)
         let node = await this.yp.await_proc(`mfs_get_autorized_node`, this.input.get(Attr.key)) || [];
-        this.debug("AAA:201", node)
         if (this.input.get(Attr.url)) {
           await this.importFile(...node);
         }
