@@ -1,19 +1,17 @@
 const { resolve } = require('path');
 const {
-  RedisStore, sysEnv, Attr, Permission, Constants, Network, toArray
+  RedisStore, sysEnv, Attr, Permission, Constants, Network, toArray, Cache
 } = require('@drumee/server-essentials');
-const { template } = require('lodash');
+const { template, isString} = require('lodash');
 const Jwt = require('jsonwebtoken'); // Make sure this is installed
 const {
-  Generator,
   Document,
   FileIo,
   Mfs,
   MfsTools,
 } = require("@drumee/server-core");
 
-const { credential_dir, server_home } = sysEnv();
-const OFFLINE_DIR = resolve(server_home, "offline", "media");
+const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync, writeFileSync } = require('jsonfile');
 const { onlyoffice: oo_secret, drumee: drumee_secret } = readFileSync(keyPath);
@@ -90,7 +88,7 @@ class OnlyOffice extends Mfs {
         nid,
         hub_id
       },
-      documentServerUrl: 'https://oo.drumee.io'
+      documentServerUrl: Cache.getSysConf('documentServerUrl')
     };
 
     // Sign the ENTIRE config as the token
@@ -218,17 +216,20 @@ class OnlyOffice extends Mfs {
     };
     let res = await Network.request(opt);
     let { md5Hash } = res;
-    let metadata = {};
     if (node.metadata) {
-      metadata = cleanSeen(node.metadata);
+      if (isString(node.metadata)) {
+        node.metadata = JSON.parse(node.metadata)
+      }
+      delete node.metadata._seen_
+    } else {
+      node.metadata = {}
     }
     node.publish_time = Math.floor(res.mtimeMs / 1000);
-    res.filesize = res.size;
-    metadata.md5Hash = md5Hash;
-    this.debug("AAA:204", res)
+    node.metadata.md5Hash = md5Hash;
+    node.filesize = res.size;
     const { db_name, uid } = ctx;
     await this.yp.await_proc(`${db_name}.mfs_set_node_attr`, node.id, node, 0);
-    await this.yp.await_proc(`${db_name}.mfs_set_metadata`, node.id, metadata, 0);
+    await this.yp.await_proc(`${db_name}.mfs_set_metadata`, node.id, { md5Hash }, 0);
     Document.rebuildInfo(
       node,
       uid,
@@ -260,6 +261,7 @@ class OnlyOffice extends Mfs {
         if (this.input.get(Attr.url)) {
           await this.importFile(...node);
         }
+        await this.yp.await_proc(`mfs_cleanup_autorized_node`)
         break;
 
       case 3: // Corrupted (error during save)
@@ -283,317 +285,6 @@ class OnlyOffice extends Mfs {
     this.output.json({ error: 0 })
   }
 
-  /**
-  * Preapre data for storage
-  * @param {*} incoming_file 
-  * @param {*} filename 
-  * @param {*} parent 
-  * @returns 
-  */
-  async store(node) {
-    const incoming_file = this.input.need(Attr.uploaded_file)
-    if (!existsSync(incoming_file)) {
-      return this.output.data({ error: "Uploaded file not found" });
-    }
-
-    if (node.filetype !== Attr.document) {
-      this.warn("TARGET IS NOT A DOCUMENT", this.input.use(Attr.filepath), node);
-      this.output.data({ error: "File type is not supported" });
-      return;
-    }
-    if (!this.import(incoming_file, node)) {
-      this.output.data({ error: "Failed to import" });
-      return
-    }
-    let md5Hash = this.input.get("md5Hash");
-    let { metadata } = node;
-    metadata = this.cleanJson(metadata);
-    metadata.md5Hash = md5Hash;
-    node.publish_time = Math.floor(new Date().getTime() / 1000);;
-
-    node.metadata = metadata;
-    await this.db.await_proc("mfs_set_node_attr", node.id, node, 0);
-    await this.db.await_proc("mfs_set_metadata", node.id, metadata, 0);
-    Document.rebuildInfo(
-      node,
-      this.uid,
-      this.input.get(Attr.socket_id)
-    );
-  }
-
-
-  /**
-   *
-   * @param {*} node
-   */
-  import(incoming_file, node) {
-    const base = resolve(node.mfs_root, node.id);
-    const ext = node.extension.toLowerCase();
-    let orig = join(base, `orig.${ext}`);
-    let info = join(base, "info.json");
-    mkdirSync(base, { recursive: true });
-    let docInfo = { buildState: Attr.working };
-    if (!mv(incoming_file, orig)) {
-      this.exception.server('FILE_ERROR');
-      return false
-    }
-    rmSync(info, { force: true });
-    writeFileSync(info, docInfo);
-    let socket_id = this.input.get(Attr.socket_id);
-    let args = {
-      node,
-      uid: this.uid,
-      socket_id,
-    };
-
-    let cmd = resolve(OFFLINE_DIR, "to-pdf.js");
-    let child = Spawn(cmd, [JSON.stringify(args)], SPAWN_OPT);
-    child.unref();
-    return true
-  }
-
-  /**
- * replace existing media by uploaded file
- * @param {*} nid 
- * @param {*} incoming_file 
- * @param {*} filename 
- * @returns 
- */
-  async replace(nid, incoming_file, filename) {
-    let node = this.granted_node();
-    if (/^(folder|root)$/.test(node.filetype)) {
-      this.warn("COULD NOT REPLACE FOLDER", this.input.use(Attr.filepath), node);
-      this.exception.user("TARGET_IS_FOLDER_OR_ROOT");
-      return;
-    }
-    let md5Hash = this.input.get("md5Hash");
-    let { metadata } = node;
-    metadata = this.cleanJson(metadata);
-    metadata.md5Hash = md5Hash;
-    let privilege = node.permission;
-    let home_dir = node.home_dir;
-    let mfs_root = node.mfs_root;
-    let data = await this.before_store(incoming_file, filename, {
-      nid: node.parent_id,
-    });
-    data.rtime = Math.floor(new Date().getTime() / 1000);
-    data.publish_time = data.rtime;
-    if (data.filename) {
-      data.user_filename = data.filename.replace(`.${data.extension}`, "");
-    }
-
-    await this.db.await_proc("mfs_set_node_attr", nid, data, 0);
-    await this.db.await_proc("mfs_set_metadata", nid, metadata, 0);
-    node.metadata = metadata;
-    await this.after_store(
-      node.pid,
-      incoming_file,
-      { ...node, privilege, home_dir, mfs_root, md5Hash },
-    );
-    node = await this.db.await_proc("mfs_access_node", this.uid, nid);
-    if (node.filetype == Attr.document) {
-      Document.rebuildInfo(
-        node,
-        this.uid,
-        this.input.get(Attr.socket_id)
-      )
-    }
-    this.output.data({
-      ...node,
-      replace: 1,
-    });
-  }
-
-  /**
- * 
- * @param {*} incoming_file 
- * @param {*} data 
- * @returns 
- */
-  async after_store(pid, incoming_file, data) {
-    const base = resolve(data.mfs_root, data.id);
-    mkdirSync(base, { recursive: true });
-    const ext = data.extension.toLowerCase();
-    let orig = `${base}/orig.${ext}`;
-    this.granted_node(data);
-    if (data.filetype == Attr.document && data.extension != Attr.pdf) {
-      if (!this.handlePdf(incoming_file, data)) {
-        data.error = 1;
-      }
-      return data;
-    }
-
-    if (!mv(incoming_file, orig) || !existsSync(orig)) {
-      this.warn(`${__filename}:337 ${orig} not found`);
-      this.exception.user(FAILED_CREATE_FILE);
-      return { ...data, error: 1 };
-    }
-
-    // Force information generation
-    if (data.filetype == Attr.document && data.extension == Attr.pdf) {
-      Document.getInfo(data);
-    }
-
-    data.position = this.input.get(Attr.position) || 0;
-
-    return data;
-  }
-
-
-
-  /**
-   * 
-   * @param {*} sessionKey 
-   * @returns 
-   */
-  async generateCallbackUrl(sessionKey) {
-    const token = require('jsonwebtoken').sign(
-      { sessionKey },
-      oo_secret,
-      { expiresIn: '1h' }
-    );
-
-    return `${this.input.homepath()}svc/onlyoffice.write?nid=${nid}&hub_id=${hub_id}&signature=${signature}`;
-  }
-
-
-  /**
-   * 
-   * @param {*} ctx 
-   */
-  async handleCallback(ctx) {
-    try {
-      const { token } = ctx.request.query;
-      const { status, url, key } = ctx.request.body;
-
-      // Verify token and get session
-      const { sessionKey } = require('jsonwebtoken').verify(token, oo_secret);
-
-      // Get session from database
-      const session = await this.drumee.db.collection('onlyoffice_sessions').findOne({
-        key: sessionKey
-      });
-
-      if (!session) {
-        ctx.throw(404, 'Session not found');
-      }
-
-      // Handle different save statuses
-      if (status === 2 || status === 6) {
-        // Document ready for saving - download it
-        const response = await require('axios')({
-          method: 'GET',
-          url: url,
-          responseType: 'stream'
-        });
-
-        // Save to Drumee filesystem
-        await this.drumee.file.write(session.nid, response.data, {
-          metadata: {
-            savedBy: session.uid,
-            savedAt: new Date(),
-            sessionId: sessionKey
-          }
-        });
-
-        // Update session status
-        await this.drumee.db.collection('onlyoffice_sessions').update(
-          { key: sessionKey },
-          { $set: { savedAt: new Date(), status: 'saved' } }
-        );
-      }
-
-      ctx.body = { error: 0 };
-    } catch (error) {
-      this.warn('Callback error:', error);
-      ctx.body = { error: 1, message: error.message };
-    }
-  }
-
-  /**
-   * 
-   */
-  test() {
-    this.debug('AAA:402', this.granted_node(), this.randomString(), OFFLINE_DIR)
-  }
 }
 
 module.exports = OnlyOffice;
-
-/**
- * 
- 
-// In your Drumee backend callback endpoint
-app.post('/api/onlyoffice/callback', async (req, res) => {
-  try {
-    const { status, url, key } = req.body;
-    
-    this.debug(`Callback received - Status: ${status}, Key: ${key}`);
-    
-    // Always return 200 with {error: 0} to acknowledge receipt
-    // The actual processing should happen asynchronously
-    
-    // For debugging, log what you received
-    if (status === 2 || status === 6) {
-      this.debug(`Document ready to download from: ${url}`);
-      
-      // Start async processing without blocking the response
-      processDocumentSave(url, key).catch(err => {
-        this.warn('Async save failed:', err);
-        // Log error but don't change the response - ONLYOFFICE already got 200
-      });
-    }
-    
-    // IMPORTANT: Respond immediately with success
-    res.json({ error: 0 });
-    
-  } catch (error) {
-    this.warn('Callback handler error:', error);
-    // Still return 200 with error=0? No - if we caught an exception, 
-    // ONLYOFFICE should retry
-    res.status(500).json({ error: 1, message: error.message });
-  }
-});
-
-// Separate async function for actual document saving
-async function processDocumentSave(url, key) {
-  try {
-    // Download the document from the provided URL
-    const response = await fetch(url, {
-      headers: {
-        // If your ONLYOFFICE requires JWT for downloads
-        'Authorization': `Bearer ${process.env.ONLYOFFICE_JWT_SECRET}`
-      }
-    });
-    
-    if (!response.ok) {
-      throw new Error(`Download failed: ${response.status}`);
-    }
-    
-    // Get the file as a buffer or stream
-    const fileBuffer = await response.buffer();
-    
-    // Get session info from your database using the key
-    const session = await db.collection('onlyoffice_sessions').findOne({ key });
-    
-    if (!session) {
-      throw new Error(`No session found for key: ${key}`);
-    }
-    
-    // Save to Drumee filesystem
-    await drumee.file.write(session.fileId, fileBuffer, {
-      metadata: {
-        savedBy: session.userId,
-        savedAt: new Date(),
-        version: await getNextVersion(session.fileId)
-      }
-    });
-    
-    this.debug(`Document ${session.fileId} saved successfully`);
-    
-  } catch (error) {
-    this.warn('Async document save failed:', error);
-    // Here you might want to implement retry logic or alerting
-  }
-}
- **/
