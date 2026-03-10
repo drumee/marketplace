@@ -44,21 +44,18 @@ class OnlyOffice extends Mfs {
    */
   async html() {
     const uid = this.uid;
-    const { hub_id, nid, filename, extension, privilege } = this.granted_node();
-
+    const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = this.granted_node();
     // Generate unique session key
     // Store the node as pre-authorized for future access based on sessionKey
-    const sessionKey = this.randomString();
-    let args = { sessionKey, hub_id, nid, uid: uid, expiry: 36000 };
-    await this.yp.await_proc('mfs_add_autorized_node', args);
+    const sessionKey = `${hub_id}.${nid}.${mtime}.${md5Hash}`;
 
     // Sign the sessionKey to ensure with wonn't be forged
-    const signature = this.signString(sessionKey);
+    const signature = this.signString(`${sessionKey}/${this.uid}`);
 
-    let query = `signature=${signature}&sessionKey=${sessionKey}`;
+    let query = `signature=${signature}&sessionKey=${sessionKey}&uid=${this.uid}`;
 
     // Get user info
-    const firstname = await this.user.get(Attr.firstname);
+    const fullname = this.user.get(Attr.fullname) || this.user.get(Attr.profile).email;
 
     // Return the configuration
     const confObject = {
@@ -73,7 +70,7 @@ class OnlyOffice extends Mfs {
         callbackUrl: `${this.input.homepath()}svc/onlyoffice.callback?key=${sessionKey}`,
         user: {
           id: uid,
-          name: firstname
+          name: fullname
         }
       },
       customization: {
@@ -135,6 +132,21 @@ class OnlyOffice extends Mfs {
 
   /**
    * 
+   */
+  async getNode(sessionKey, uid, permission) {
+    let [hub_id, nid] = sessionKey.split(".");
+    const db_name = await this.yp.await_func('get_db_name', hub_id);
+    const node = await this.yp.await_proc(`${db_name}.mfs_access_node`, uid, nid);
+    if (!node || !node.privilege || !(node.privilege & permission)) {
+      this.warn('Node info not found');
+      this.exception.unauthorized("Permission denied")
+      return null;
+    }
+    return { node, db_name, hub_id, nid, uid };
+  }
+
+  /**
+   * 
    * @param {*} sessionKey 
    * @returns 
    */
@@ -147,9 +159,11 @@ class OnlyOffice extends Mfs {
       let p = new URL(decoded.payload.url).searchParams
       // Extract parameters from token payload
       const sessionKey = p.get('sessionKey')
+      const uid = p.get(Attr.uid);
+      const payload = `${sessionKey}/${uid}`
       const signature = require('crypto')
         .createHmac('sha256', drumee_secret)
-        .update(sessionKey)
+        .update(payload)
         .digest('hex');
 
       // Check signature to ensure URL integrity
@@ -157,18 +171,10 @@ class OnlyOffice extends Mfs {
         this.warn('Invalid signature', signature, p, decoded.payload.url);
         return this.exception.unauthorized("Permission denied")
       }
-
-      let node = await this.yp.await_proc(`mfs_get_autorized_node`, sessionKey);
-      if (!node.length) {
-        this.warn('Node info not found');
-        return this.exception.unauthorized("Permission denied")
+      let { node } = await this.getNode(sessionKey, uid, Permission.read)
+      if (node) {
+        await this.send_media(node, ORIGINAL);
       }
-      if (node[0].privilege & Permission.read) {
-        await this.send_media(node[0], ORIGINAL);
-        return;
-      }
-      this.exception.unauthorized("Permission denied")
-
     } catch (jwtError) {
       this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
       this.exception.unauthorized("Invalid authorization token")
@@ -197,18 +203,17 @@ class OnlyOffice extends Mfs {
   * @param {*} dir
   * @param {*} filter
   */
-  async importFile(node, ctx) {
-    if (!node) {
-      this.warn("importFile failed. Node not found");
-      return
-    }
+  async importFile(url, sessionKey, uid) {
+    let { node, db_name } = await this.getNode(sessionKey, uid, Permission.write)
+    if (!node) return
+
     const base = resolve(node.home_dir, node.nid)
     const outfile = resolve(base, `orig.${node.ext}`)
     this.debug(`Downloading ${this.input.get(Attr.url)} => ${outfile}.`);
     let opt = {
       method: 'GET',
       outfile,
-      url: this.input.get(Attr.url),
+      url
     };
     let res = await Network.request(opt);
     let { md5Hash } = res;
@@ -226,7 +231,6 @@ class OnlyOffice extends Mfs {
     node.md5Hash = md5Hash;
     node.filesize = res.size;
     node.mtime = node.publish_time;
-    const { db_name, uid } = ctx;
     await this.yp.await_proc(`${db_name}.mfs_set_node_attr`, node.id, node, 0);
     await this.yp.await_proc(`${db_name}.mfs_set_metadata`, node.id, { md5Hash }, 0);
     Document.rebuildInfo(
@@ -238,33 +242,62 @@ class OnlyOffice extends Mfs {
   }
 
   /**
+   * 
+   */
+  async handleError() {
+    this.warn("AAA:244:handleError", this.input.body())
+  }
+
+  /**
+   * 
+   */
+  async handleCollaboration() {
+    this.debug("AAA:251:handleCollaboration", this.input.body())
+  }
+
+  /**
+   * 
+   */
+  async handleClosure(data) {
+    const { actions, notmodified, history, key, url } = data;
+    if (notmodified) return;
+    for (let action of actions) {
+      switch (action.type) {
+        case 0:
+          if (url) await this.importFile(url, key, action.userid);
+          break;
+        case 1:
+          this.debug("New user joining")
+          break;
+        case 2:
+      }
+    }
+  }
+
+  /**
    * Callback endpoint from onlyoffice
    * Always return 200 with {error: 0} to acknowledge receipt
    * @param {*} sessionKey 
    * @returns 
    */
   async callback() {
+    let data = {};
     try {
-      Jwt.verify(this.input.get(Attr.token), oo_secret);
+      data = Jwt.verify(this.input.get(Attr.token), oo_secret);
     } catch (jwtError) {
       this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
       this.exception.unauthorized("Invalid authorization token")
       return
     }
-
-    switch (this.input.get(Attr.status)) {
+    switch (data.status) {
       case 6: // MustForceSave (force save during editing)
       case 2: // MustSave (normal save after closing)
-        let node = await this.yp.await_proc(`mfs_get_autorized_node`, this.input.get(Attr.key)) || [];
-        if (this.input.get(Attr.url)) {
-          await this.importFile(...node);
-        }
-        await this.yp.await_proc(`mfs_cleanup_autorized_node`)
+        await this.handleClosure(data)
         break;
 
       case 3: // Corrupted (error during save)
       case 7: // Force save error
-        this.warn('Document save error:', callbackData);
+        this.handleError(data);
         // Log error but still acknowledge
         break;
 
@@ -273,11 +306,11 @@ class OnlyOffice extends Mfs {
         break;
 
       case 1: // Editing in progress
-        // Just acknowledge, no action needed
+        this.handleCollaboration(data)
         break;
 
       default:
-        this.debug('Unhandled status:', callbackData.status);
+        this.debug('Unhandled status:', this.input.body());
 
     }
     this.output.json({ error: 0 })
