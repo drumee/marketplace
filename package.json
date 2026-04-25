@@ -9,7 +9,8 @@
     "register-plugin": "drumee-server-plugin add",
     "remove-plugin": "drumee-server-plugin remove",
     "release": "git push && npm publish --access public && npm version patch",
-    "send-beta-email": "node emailing/scripts/send-beta-announcement.js"
+    "send-beta-email": "node emailing/scripts/send-beta-announcement.js",
+    "setup": "node node_modules/@drumee/server-dev-tools/env/write-env.js --type=app --output devel --base-dir=$(pwd)"
   },
   "repository": {
     "type": "git",
@@ -30,6 +31,6 @@
     "lodash": "^4.17.21"
   },
   "devDependencies": {
-    "@drumee/server-dev-tools": "^1.1.32"
+    "@drumee/server-dev-tools": "^1.1.33"
   }
 }

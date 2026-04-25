@@ -1,4 +1,4 @@
-const { resolve } = require('path');
+const { resolve, join } = require('path');
 const {
   RedisStore, sysEnv, Attr, Permission, Constants, Network, toArray, Cache
 } = require('@drumee/server-essentials');
@@ -7,13 +7,13 @@ const Jwt = require('jsonwebtoken'); // Make sure this is installed
 const {
   Document,
   Mfs,
-  MfsTools,
+  MfsTools
 } = require("@drumee/server-core");
-const { cleanSeen } = MfsTools;
+const { move_node, copy_node } = MfsTools;
 const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync } = require('jsonfile');
-const { onlyoffice: oo_secret, drumee: drumee_secret } = readFileSync(keyPath);
+const { EurOffice: eo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
 } = Constants;
@@ -22,14 +22,14 @@ const {
   readFileSync: readFile,
 } = require("fs");
 
-class OnlyOffice extends Mfs {
+class EurOffice extends Mfs {
 
   /**
  *
  */
   async sendHtml(data) {
     const { main_domain } = sysEnv()
-    const tpl = resolve(__dirname, 'templates/index.html');
+    const tpl = resolve(__dirname, 'templates/euroffice.html');
     let html = readFile(tpl);
     html = String(html).trim().toString();
     const content = template(html)(data);
@@ -45,9 +45,9 @@ class OnlyOffice extends Mfs {
   async html() {
     const uid = this.uid;
     const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = this.granted_node();
-    // Generate unique session key
-    // Store the node as pre-authorized for future access based on sessionKey
-    const sessionKey = `${hub_id}.${nid}.${mtime}.${md5Hash}`;
+
+    // The session key is used by only office unique id for colaboration. 
+    const sessionKey = `${hub_id}.${nid}.${mtime}`;
 
     // Sign the sessionKey to ensure with wonn't be forged
     const signature = this.signString(`${sessionKey}/${this.uid}`);
@@ -63,11 +63,11 @@ class OnlyOffice extends Mfs {
         fileType: extension,
         key: sessionKey,
         title: filename,
-        url: `${this.input.homepath()}svc/onlyoffice.read?${query}`
+        url: `${this.input.homepath()}svc/euroffice.read?${query}`
       },
       editorConfig: {
         mode: privilege & Permission.write ? 'edit' : 'view',
-        callbackUrl: `${this.input.homepath()}svc/onlyoffice.callback?key=${sessionKey}`,
+        callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}`,
         user: {
           id: uid,
           name: fullname
@@ -81,13 +81,13 @@ class OnlyOffice extends Mfs {
         nid,
         hub_id
       },
-      documentServerUrl: Cache.getSysConf('documentServerUrl')
+      documentServerUrl: Cache.getSysConf('eurofficeServerUrl')
     };
 
     // Sign the ENTIRE config as the token
     const token = Jwt.sign(
       confObject,
-      oo_secret
+      eo_secret
     );
 
     // Add token to config sent to frontend
@@ -120,11 +120,11 @@ class OnlyOffice extends Mfs {
     const token = authHeader.substring(7);
     try {
       // Verify the token and extract payload
-      const decoded = Jwt.verify(token, oo_secret);
+      const decoded = Jwt.verify(token, eo_secret);
       return new URL(decoded.payload.url).searchParams
 
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
       this.exception.unauthorized("Invalid authorization token")
       return {};
     }
@@ -155,7 +155,7 @@ class OnlyOffice extends Mfs {
     const token = authHeader.substring(7);
     try {
       // Verify the token and extract payload
-      const decoded = Jwt.verify(token, oo_secret);
+      const decoded = Jwt.verify(token, eo_secret);
       let p = new URL(decoded.payload.url).searchParams
       // Extract parameters from token payload
       const sessionKey = p.get('sessionKey')
@@ -176,7 +176,7 @@ class OnlyOffice extends Mfs {
         await this.send_media(node, ORIGINAL);
       }
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
       this.exception.unauthorized("Invalid authorization token")
     }
 
@@ -186,11 +186,11 @@ class OnlyOffice extends Mfs {
    * 
    * @param {*} args 
    */
-  async sendNodeAttributes(node) {
+  async sendNodeAttributes(node, service = "media.replace") {
     let recipients = await this.yp.await_proc("entity_sockets", {
       hub_id: node.hub_id,
     });
-    let payload = this.payload(node, { service: "media.replace" });
+    let payload = this.payload(node, { service });
     for (let r of toArray(recipients)) {
       await RedisStore.sendData(payload, r);
     }
@@ -275,7 +275,7 @@ class OnlyOffice extends Mfs {
   }
 
   /**
-   * Callback endpoint from onlyoffice
+   * Callback endpoint from EurOffice
    * Always return 200 with {error: 0} to acknowledge receipt
    * @param {*} sessionKey 
    * @returns 
@@ -283,9 +283,9 @@ class OnlyOffice extends Mfs {
   async callback() {
     let data = {};
     try {
-      data = Jwt.verify(this.input.get(Attr.token), oo_secret);
+      data = Jwt.verify(this.input.get(Attr.token), eo_secret);
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
       this.exception.unauthorized("Invalid authorization token")
       return
     }
@@ -316,6 +316,38 @@ class OnlyOffice extends Mfs {
     this.output.json({ error: 0 })
   }
 
+  /**
+   * 
+   */
+  async new_doc() {
+    const name = this.input.need(Attr.name);
+    const { hub_id, nid: pid } = this.granted_node();
+    let { db_name, path } = JSON.parse(Cache.getSysConf('doc_templates'));
+    let filepath = join(path, name);
+    let src = await this.yp.await_proc(`${db_name}.mfs_access_node`, this.uid, filepath)
+    let source = [{ hub_id: src.hub_id, nid: src.nid }]
+    let data = await this.db.await_proc('mfs_copy_all', source, this.uid, pid, hub_id)
+    let copied;
+    for (let node of data) {
+      switch (node.action) {
+        case "copy":
+          let src = { nid: node.nid, mfs_root: node.src_mfs_root };
+          let dest = { nid: node.des_id, mfs_root: node.des_mfs_root };
+          try {
+            copy_node(src, dest, 0);
+          } catch (e) {
+            this.warn("COPY FAILED ", e);
+          }
+          break;
+        case "show":
+          copied = await this.db.await_proc("mfs_access_node", this.uid, node.nid)
+          await this.sendNodeAttributes(copied, "media.new")
+          break;
+      }
+    }
+    this.output.data(copied)
+  }
+
 }
 
-module.exports = OnlyOffice;
+module.exports = EurOffice;

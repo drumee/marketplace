@@ -86,7 +86,7 @@
     }
   },
   "modules": {
-    "private": "service/onlyoffice",
-    "public": "service/onlyoffice"
+    "private": "service/euroffice",
+    "public": "service/euroffice"
   }
 }

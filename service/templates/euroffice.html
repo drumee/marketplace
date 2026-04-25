@@ -1,0 +1,24 @@
+<div id="editor-<%= editorConfig.user.uid %>"></div>
+<script type="text/javascript" src="<%= documentServerUrl %>/web-apps/apps/api/documents/api.js"></script>
+<script>
+  const config = {
+    document: {
+      fileType: "<%= document.fileType %>",
+      key: "<%= document.key %>",
+      title: "<%= document.title %>",
+      url: "<%= document.url %>",
+      documentType: "<%= document.documentType %>"
+    },
+    editorConfig: {
+      mode: "<%= editorConfig.mode %>",
+      callbackUrl: "<%= editorConfig.callbackUrl %>",
+      user: {
+        id: "<%= editorConfig.user.id %>",
+        name: "<%= editorConfig.user.name %>"
+      }
+    },
+    documentServerUrl: "<%= documentServerUrl %>",
+    token: "<%= token %>"
+  }
+  const docEditor = new DocsAPI.DocEditor("editor-<%= editorConfig.user.uid %>", config); 
+</script>
