@@ -30,6 +30,36 @@
         }
       ]
     },
+    "preload": {
+      "doc": "Send a html page with template content to force frontend to cache ",
+      "scope": "hub",
+      "permission": {
+        "src": "read"
+      },
+      "params": {
+        "nid": {
+          "type": "string",
+          "required": true,
+          "doc": "File node id."
+        },
+        "hub_id": {
+          "type": "string",
+          "required": true,
+          "doc": "File hub id."
+        }
+      },
+      "returns": {
+        "type": "octet/stream",
+        "doc": "Render the templates/index.html with data required by the onlyoffice document server."
+      },
+      "errors": [
+        {
+          "code": "PERMISSION_DENIED",
+          "message": "Permission denied",
+          "http_status": 401
+        }
+      ]
+    },
     "read": {
       "doc": "Send requested file content. Permission intentionally set to anonymous because it's sent by third party. The permission control relies on the the method onlyoffice.html",
       "scope": "hub",

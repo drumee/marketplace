@@ -39,13 +39,14 @@ class EurOffice extends Mfs {
     this.output.html(content);
   }
 
+
   /**
    * 
    */
-  async html() {
+  async html(src) {
     const uid = this.uid;
-    const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = this.granted_node();
-
+    const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = src || this.granted_node();
+    let mode = privilege & Permission.write ? 'edit' : 'view';
     // The session key is used by only office unique id for colaboration. 
     const sessionKey = `${hub_id}.${nid}.${mtime}`;
 
@@ -66,7 +67,7 @@ class EurOffice extends Mfs {
         url: `${this.input.homepath()}svc/euroffice.read?${query}`
       },
       editorConfig: {
-        mode: privilege & Permission.write ? 'edit' : 'view',
+        mode,
         callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}`,
         user: {
           id: uid,
@@ -96,6 +97,20 @@ class EurOffice extends Mfs {
     this.sendHtml(confObject)
   }
 
+  /**
+   * 
+   */
+  async preload() {
+    const uid = this.uid;
+    const name = this.input.need(Attr.name);
+
+    let { db_name, path } = JSON.parse(Cache.getSysConf('doc_templates'));
+    let filepath = join(path, name);
+    let src = await this.yp.await_proc(`${db_name}.mfs_access_node`, this.uid, filepath)
+
+    await this.html(src)
+    
+  }
   /**
    * 
    * @param {*} nid 
