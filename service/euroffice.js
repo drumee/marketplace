@@ -58,6 +58,9 @@ class EurOffice extends Mfs {
     // Get user info
     const fullname = this.user.get(Attr.fullname) || this.user.get(Attr.profile).email;
 
+    // Map the app theme forwarded by the frontend onto the OnlyOffice uiTheme.
+    const uiTheme = this.input.use('theme', 'light') === 'dark' ? 'theme-dark' : 'theme-light';
+
     // Return the configuration
     const confObject = {
       document: {
@@ -72,6 +75,9 @@ class EurOffice extends Mfs {
         user: {
           id: uid,
           name: fullname
+        },
+        customization: {
+          uiTheme
         }
       },
       customization: {
