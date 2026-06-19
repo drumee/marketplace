@@ -47,38 +47,15 @@ class EurOffice extends Mfs {
     const uid = this.uid;
     const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = src || this.granted_node();
     let mode = privilege & Permission.write ? 'edit' : 'view';
-    // Secure-share recipient: the DMZ session is bound to the share CREATOR (full
-    // privilege), so derive the editor mode from the SHARE TOKEN's caps instead of
-    // the session. Read-only UNLESS the share explicitly grants can_edit (Phase 2).
-    // Desk/normal editor requests carry no token and are unaffected.
-    const _shareToken = this.input.use('token', null);
-    if (_shareToken) {
+    // Secure-share recipient (Phase 1): the DMZ session is bound to the share
+    // CREATOR (full privilege), so `mode` above would wrongly resolve to 'edit'
+    // for a view-only recipient. When the request carries a share token, force
+    // READ-ONLY. Editing for edit-grant recipients is deferred (Phase 2) until the
+    // document-server save callback is gated by the share caps — today that
+    // callback writes as the creator. Desk/normal editor requests carry no token,
+    // so they are unaffected.
+    if (this.input.use('token', null)) {
       mode = 'view';
-      try {
-        const _caps = await this._secureShareCaps(_shareToken);
-        // Node-scope: confine the recipient to the SHARED subtree. The session is
-        // creator-bound, so a crafted foreign nid would otherwise resolve via the
-        // creator's ACL. Deny ONLY on a positive out-of-scope result; FAIL OPEN on
-        // any error (e.g. mfs_node_in_subtree not yet applied to the DB) so doc
-        // viewing never breaks — the gate activates once the SP is live.
-        if (_caps.valid && _caps.node_id && _caps.db_name) {
-          let _outOfScope = false;
-          try {
-            const _r = await this.yp.await_proc(`${_caps.db_name}.mfs_node_in_subtree`, _caps.node_id, nid);
-            const _row = Array.isArray(_r) ? _r[0] : _r;
-            if (_row && Number(_row.in_scope) === 0) _outOfScope = true;
-          } catch (e) {
-            this.warn('[euroffice.html] node-scope check unavailable (fail-open):', e && e.message);
-          }
-          if (_outOfScope) {
-            this.warn('[euroffice.html] node outside share subtree — denied');
-            return this.exception.unauthorized('Permission denied');
-          }
-        }
-        if (_caps.canEdit) mode = 'edit';
-      } catch (e) {
-        this.warn('[euroffice.html] share caps lookup failed:', e && e.message);
-      }
     }
     // The session key is used by only office unique id for colaboration.
     const sessionKey = `${hub_id}.${nid}.${mtime}`;
@@ -104,7 +81,7 @@ class EurOffice extends Mfs {
       },
       editorConfig: {
         mode,
-        callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}${_shareToken ? `&stoken=${encodeURIComponent(_shareToken)}` : ''}`,
+        callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}`,
         user: {
           id: uid,
           name: fullname
@@ -162,27 +139,6 @@ class EurOffice extends Mfs {
       .createHmac('sha256', drumee_secret)
       .update(query)
       .digest('hex');
-  }
-
-  /**
-   * Resolve a secure-share token's capabilities. Used to drive the editor mode
-   * (read-only unless the share grants can_edit) and to gate the save callback,
-   * so the editor never trusts the creator-bound session for the edit decision.
-   * Returns { valid, canEdit, node_id, hub_id }.
-   */
-  async _secureShareCaps(token) {
-    const res = await this.yp.await_proc('secure_share_info', token);
-    const info = Array.isArray(res) ? res[0] : res;
-    if (!info || info.validity !== 'TICKET_OK') {
-      return { valid: false, canEdit: false };
-    }
-    let caps = info.capabilities;
-    if (typeof caps === 'string') {
-      try { caps = JSON.parse(caps); } catch (e) { caps = []; }
-    }
-    if (!Array.isArray(caps)) caps = [];
-    const canEdit = caps.includes('can_edit') || info.permission_level === 'can_edit';
-    return { valid: true, canEdit, node_id: info.node_id, hub_id: info.hub_id, db_name: info.db_name };
   }
 
   /**
@@ -363,25 +319,6 @@ class EurOffice extends Mfs {
       this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
       this.exception.unauthorized("Invalid authorization token")
       return
-    }
-    // Secure-share recipient: a SAVE is only honored when the share grants can_edit
-    // (the editor config puts the share token on the callback URL as `stoken`).
-    // This stops a view-only recipient from crafting a save to overwrite the shared
-    // file. A normal desk editor save carries no stoken and is unaffected. Fail-safe:
-    // on any doubt, ack without saving (the doc-server treats error:0 as handled, so
-    // it won't retry).
-    const _stoken = this.input.use('stoken', null);
-    if (_stoken && (data.status === 2 || data.status === 6)) {
-      let _canEdit = false;
-      try {
-        _canEdit = (await this._secureShareCaps(_stoken)).canEdit;
-      } catch (e) {
-        this.warn('[euroffice.callback] share caps check failed:', e && e.message);
-      }
-      if (!_canEdit) {
-        this.warn('[euroffice.callback] save rejected: share token lacks can_edit');
-        return this.output.json({ error: 0 });
-      }
     }
     switch (data.status) {
       case 6: // MustForceSave (force save during editing)
