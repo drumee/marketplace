@@ -47,7 +47,17 @@ class EurOffice extends Mfs {
     const uid = this.uid;
     const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = src || this.granted_node();
     let mode = privilege & Permission.write ? 'edit' : 'view';
-    // The session key is used by only office unique id for colaboration. 
+    // Secure-share recipient (Phase 1): the DMZ session is bound to the share
+    // CREATOR (full privilege), so `mode` above would wrongly resolve to 'edit'
+    // for a view-only recipient. When the request carries a share token, force
+    // READ-ONLY. Editing for edit-grant recipients is deferred (Phase 2) until the
+    // document-server save callback is gated by the share caps — today that
+    // callback writes as the creator. Desk/normal editor requests carry no token,
+    // so they are unaffected.
+    if (this.input.use('token', null)) {
+      mode = 'view';
+    }
+    // The session key is used by only office unique id for colaboration.
     const sessionKey = `${hub_id}.${nid}.${mtime}`;
 
     // Sign the sessionKey to ensure with wonn't be forged
