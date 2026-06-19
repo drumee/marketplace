@@ -53,10 +53,14 @@ class EurOffice extends Mfs {
     // grants can_edit; the SAVE callback additionally re-checks can_edit and writes
     // as the share creator. Desk/normal editor requests carry no token → unaffected.
     const _shareToken = this.input.use('token', null);
+    // The recipient's email — the key for per-recipient approved grants (mirror
+    // dmz.js: authenticated → user.profile.email, lowercased/trimmed).
+    const _recipientEmail = String(((this.user && this.user.get(Attr.profile)) || {}).email || '').toLowerCase().trim() || null;
+    let _caps = null;
     if (_shareToken) {
       mode = 'view';
       try {
-        const _caps = await this._secureShareCaps(_shareToken);
+        _caps = await this._secureShareCaps(_shareToken, _recipientEmail);
         if (_caps.valid && _caps.node_id && _caps.db_name) {
           // Node-scope: deny opening a node outside the shared subtree (a crafted
           // foreign nid would otherwise resolve via the creator-bound session).
@@ -78,6 +82,19 @@ class EurOffice extends Mfs {
       } catch (e) {
         this.warn('[euroffice.html] share caps lookup failed:', e && e.message);
       }
+    }
+    // Tamper-proof save-authorization for the (anonymous) save callback: it can't look
+    // up the recipient's per-recipient grant, so html signs the decision (canEdit +
+    // node identity + creator) with eo_secret. A view-only recipient's token says
+    // canEdit:false and can't be forged to true; expires so a stale token can't be
+    // replayed after access changes.
+    let _cdt = '';
+    if (_shareToken && _caps && _caps.valid) {
+      _cdt = Jwt.sign(
+        { nid, node_id: _caps.node_id, db_name: _caps.db_name, canEdit: !!_caps.canEdit, creator_id: _caps.creator_id },
+        eo_secret,
+        { expiresIn: '12h' }
+      );
     }
     // The session key is used by only office unique id for colaboration.
     const sessionKey = `${hub_id}.${nid}.${mtime}`;
@@ -103,7 +120,7 @@ class EurOffice extends Mfs {
       },
       editorConfig: {
         mode,
-        callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}${_shareToken ? `&stoken=${encodeURIComponent(_shareToken)}` : ''}`,
+        callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}${_cdt ? `&cdt=${encodeURIComponent(_cdt)}` : ''}`,
         user: {
           id: uid,
           name: fullname
@@ -169,18 +186,37 @@ class EurOffice extends Mfs {
    * — so the editor never trusts the creator-bound session for the edit decision.
    * Returns { valid, canEdit, node_id, hub_id, db_name, creator_id }.
    */
-  async _secureShareCaps(token) {
+  async _secureShareCaps(token, email) {
     const res = await this.yp.await_proc('secure_share_info', token);
     const info = Array.isArray(res) ? res[0] : res;
     if (!info || info.validity !== 'TICKET_OK') {
       return { valid: false, canEdit: false };
     }
-    let caps = info.capabilities;
-    if (typeof caps === 'string') {
-      try { caps = JSON.parse(caps); } catch (e) { caps = []; }
+    // Base caps from the token — mirror dmz.js parsing (array | JSON string | enum).
+    let caps = [];
+    const rawCaps = info.capabilities;
+    if (Array.isArray(rawCaps)) caps = rawCaps.slice();
+    else if (typeof rawCaps === 'string') {
+      try { const p = JSON.parse(rawCaps); if (Array.isArray(p)) caps = p; } catch (e) {}
     }
-    if (!Array.isArray(caps)) caps = [];
-    const canEdit = caps.includes('can_edit') || info.permission_level === 'can_edit';
+    if (!caps.length && info.permission_level && info.permission_level !== 'can_view') {
+      caps = [info.permission_level];
+    }
+    // UNION the recipient's APPROVED per-recipient grants (keyed on email), exactly as
+    // dmz.js login does. An approval is stored as an access-request grant, NOT in the
+    // token's base caps — so without this the editor never sees a granted can_edit.
+    if (email) {
+      try {
+        const grants = toArray(await this.yp.await_proc('secure_share_get_access_grant', token, email));
+        for (const g of grants) {
+          String((g && g.granted_level) || '').split(',').map((s) => s.trim()).filter(Boolean)
+            .forEach((l) => { if (!caps.includes(l)) caps.push(l); });
+        }
+      } catch (e) {
+        this.warn('[euroffice] get_access_grant failed:', e && e.message);
+      }
+    }
+    const canEdit = caps.includes('can_edit');
     return {
       valid: true,
       canEdit,
@@ -379,36 +415,31 @@ class EurOffice extends Mfs {
       this.exception.unauthorized("Invalid authorization token")
       return
     }
-    // Secure-share recipient SAVE gating. The editor config puts the share token on
-    // the callback URL (stoken). A save (MustSave/MustForceSave) is only honored when
-    // the share grants can_edit AND the saved node is within the shared subtree; the
-    // write is then performed as the share CREATOR (file owner — the recipient's own
-    // uid has no ACL). A normal desk save carries no stoken and is unaffected.
+    // Secure-share recipient SAVE gating. The callback is an anonymous doc-server
+    // call, so it can't look up the recipient's per-recipient grant — instead it
+    // verifies the tamper-proof decision token (cdt) html signed (eo_secret): a save
+    // (MustSave/MustForceSave) is only honored when cdt.canEdit is true AND the saved
+    // node matches the signed nid; the write is then performed as the share CREATOR.
+    // A normal desk save carries no cdt and is unaffected.
     let _saveUid = null;
-    const _stoken = this.input.use('stoken', null);
-    if (_stoken && (data.status === 2 || data.status === 6)) {
-      let _caps = { canEdit: false };
-      try { _caps = await this._secureShareCaps(_stoken); }
-      catch (e) { this.warn('[euroffice.callback] share caps check failed:', e && e.message); }
-      if (!_caps.canEdit) {
-        this.warn('[euroffice.callback] save rejected: share token lacks can_edit');
+    const _cdtRaw = this.input.use('cdt', null);
+    if (_cdtRaw && (data.status === 2 || data.status === 6)) {
+      let _d = null;
+      try { _d = Jwt.verify(_cdtRaw, eo_secret); }
+      catch (e) { this.warn('[euroffice.callback] cdt verify failed:', e && e.message); }
+      if (!_d || !_d.canEdit) {
+        this.warn('[euroffice.callback] save rejected: not editable per signed decision');
         return this.output.json({ error: 0 });
       }
-      // Node-scope the saved node (defense-in-depth; the sessionKey is signed by html).
+      // Confine the save to the node html signed. Both nids come from eo_secret-signed
+      // sources (data.key = doc-server token, _d.nid = html), so a crafted save with a
+      // different key is rejected.
       const _nid = String(data.key || '').split('.')[1];
-      if (_caps.node_id && _caps.db_name && _nid) {
-        try {
-          const _r = await this.yp.await_proc(`${_caps.db_name}.mfs_node_in_subtree`, _caps.node_id, _nid);
-          const _row = Array.isArray(_r) ? _r[0] : _r;
-          if (_row && Number(_row.in_scope) === 0) {
-            this.warn('[euroffice.callback] save rejected: node outside share subtree');
-            return this.output.json({ error: 0 });
-          }
-        } catch (e) {
-          this.warn('[euroffice.callback] save node-scope check unavailable (fail-open):', e && e.message);
-        }
+      if (_nid && _d.nid && _nid !== _d.nid) {
+        this.warn('[euroffice.callback] save rejected: node mismatch');
+        return this.output.json({ error: 0 });
       }
-      _saveUid = _caps.creator_id || null;
+      _saveUid = _d.creator_id || null;
     }
     switch (data.status) {
       case 6: // MustForceSave (force save during editing)
