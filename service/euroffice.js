@@ -474,11 +474,56 @@ class EurOffice extends Mfs {
   async new_doc() {
     const name = this.input.need(Attr.name);
     const { hub_id, nid: pid } = this.granted_node();
+    // Secure-share recipient: creating a document is a WRITE. When a share token is
+    // present, don't trust the session — require that the share grants can_edit and
+    // CONFINE the new doc's destination (pid) to the shared subtree. The copy then
+    // runs as the share CREATOR (file owner), exactly like the editor save path
+    // (handleClosure overrideUid): a signed-in recipient is bound to their OWN uid
+    // (dmz.js node-grant binding), so running as the creator guarantees the copy is
+    // authorized on the creator's folder and the new file is creator-owned (uniform
+    // with all share content). Desk requests carry no token → operate as this.uid,
+    // unchanged.
+    const _shareToken = this.input.use('token', null);
+    let _opUid = this.uid;
+    if (_shareToken) {
+      const _recipientEmail = String(((this.user && this.user.get(Attr.profile)) || {}).email || '').toLowerCase().trim() || null;
+      let _caps = null;
+      try {
+        _caps = await this._secureShareCaps(_shareToken, _recipientEmail);
+      } catch (e) {
+        this.warn('[euroffice.new_doc] share caps lookup failed:', e && e.message);
+        return this.exception.unauthorized('Permission denied');
+      }
+      if (!_caps || !_caps.valid || !_caps.canEdit) {
+        this.warn('[euroffice.new_doc] create denied: share does not grant can_edit');
+        return this.exception.unauthorized('Permission denied');
+      }
+      // Node-scope: the destination folder MUST be inside the shared subtree (a
+      // crafted foreign pid would otherwise resolve via the creator-bound session).
+      // Deny ONLY on a positive out-of-scope result; FAIL OPEN on any error (the SP
+      // may be absent on some instances → behave as today). Mirrors html().
+      if (_caps.node_id && _caps.db_name) {
+        let _outOfScope = false;
+        try {
+          const _r = await this.yp.await_proc(`${_caps.db_name}.mfs_node_in_subtree`, _caps.node_id, pid);
+          const _row = Array.isArray(_r) ? _r[0] : _r;
+          if (_row && Number(_row.in_scope) === 0) _outOfScope = true;
+        } catch (e) {
+          this.warn('[euroffice.new_doc] node-scope check unavailable (fail-open):', e && e.message);
+        }
+        if (_outOfScope) {
+          this.warn('[euroffice.new_doc] destination outside share subtree — denied');
+          return this.exception.unauthorized('Permission denied');
+        }
+      }
+      // Operate as the creator from here on (template read, copy, read-back).
+      if (_caps.creator_id) _opUid = _caps.creator_id;
+    }
     let { db_name, path } = JSON.parse(Cache.getSysConf('doc_templates'));
     let filepath = join(path, name);
-    let src = await this.yp.await_proc(`${db_name}.mfs_access_node`, this.uid, filepath)
+    let src = await this.yp.await_proc(`${db_name}.mfs_access_node`, _opUid, filepath)
     let source = [{ hub_id: src.hub_id, nid: src.nid }]
-    let data = await this.db.await_proc('mfs_copy_all', source, this.uid, pid, hub_id)
+    let data = await this.db.await_proc('mfs_copy_all', source, _opUid, pid, hub_id)
     let copied;
     for (let node of data) {
       switch (node.action) {
@@ -492,7 +537,7 @@ class EurOffice extends Mfs {
           }
           break;
         case "show":
-          copied = await this.db.await_proc("mfs_access_node", this.uid, node.nid)
+          copied = await this.db.await_proc("mfs_access_node", _opUid, node.nid)
           await this.sendNodeAttributes(copied, "media.new")
           break;
       }
