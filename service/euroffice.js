@@ -56,6 +56,25 @@ class EurOffice extends Mfs {
       mode = 'view';
       try {
         const _caps = await this._secureShareCaps(_shareToken);
+        // Node-scope: confine the recipient to the SHARED subtree. The session is
+        // creator-bound, so a crafted foreign nid would otherwise resolve via the
+        // creator's ACL. Deny ONLY on a positive out-of-scope result; FAIL OPEN on
+        // any error (e.g. mfs_node_in_subtree not yet applied to the DB) so doc
+        // viewing never breaks — the gate activates once the SP is live.
+        if (_caps.valid && _caps.node_id && _caps.db_name) {
+          let _outOfScope = false;
+          try {
+            const _r = await this.yp.await_proc(`${_caps.db_name}.mfs_node_in_subtree`, _caps.node_id, nid);
+            const _row = Array.isArray(_r) ? _r[0] : _r;
+            if (_row && Number(_row.in_scope) === 0) _outOfScope = true;
+          } catch (e) {
+            this.warn('[euroffice.html] node-scope check unavailable (fail-open):', e && e.message);
+          }
+          if (_outOfScope) {
+            this.warn('[euroffice.html] node outside share subtree — denied');
+            return this.exception.unauthorized('Permission denied');
+          }
+        }
         if (_caps.canEdit) mode = 'edit';
       } catch (e) {
         this.warn('[euroffice.html] share caps lookup failed:', e && e.message);
@@ -163,7 +182,7 @@ class EurOffice extends Mfs {
     }
     if (!Array.isArray(caps)) caps = [];
     const canEdit = caps.includes('can_edit') || info.permission_level === 'can_edit';
-    return { valid: true, canEdit, node_id: info.node_id, hub_id: info.hub_id };
+    return { valid: true, canEdit, node_id: info.node_id, hub_id: info.hub_id, db_name: info.db_name };
   }
 
   /**
