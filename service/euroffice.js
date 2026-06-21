@@ -47,7 +47,56 @@ class EurOffice extends Mfs {
     const uid = this.uid;
     const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = src || this.granted_node();
     let mode = privilege & Permission.write ? 'edit' : 'view';
-    // The session key is used by only office unique id for colaboration. 
+    // Secure-share recipient: derive the editor mode from the SHARE TOKEN's caps
+    // (the session is creator-bound = full priv, so `mode` above is unreliable) and
+    // CONFINE the opened node to the shared subtree. Read-only unless the share
+    // grants can_edit; the SAVE callback additionally re-checks can_edit and writes
+    // as the share creator. Desk/normal editor requests carry no token → unaffected.
+    const _shareToken = this.input.use('token', null);
+    // The recipient's email — the key for per-recipient approved grants (mirror
+    // dmz.js: authenticated → user.profile.email, lowercased/trimmed).
+    const _recipientEmail = String(((this.user && this.user.get(Attr.profile)) || {}).email || '').toLowerCase().trim() || null;
+    let _caps = null;
+    if (_shareToken) {
+      mode = 'view';
+      try {
+        _caps = await this._secureShareCaps(_shareToken, _recipientEmail);
+        if (_caps.valid && _caps.node_id && _caps.db_name) {
+          // Node-scope: deny opening a node outside the shared subtree (a crafted
+          // foreign nid would otherwise resolve via the creator-bound session).
+          // Deny ONLY on a positive out-of-scope result; FAIL OPEN on any error.
+          let _outOfScope = false;
+          try {
+            const _r = await this.yp.await_proc(`${_caps.db_name}.mfs_node_in_subtree`, _caps.node_id, nid);
+            const _row = Array.isArray(_r) ? _r[0] : _r;
+            if (_row && Number(_row.in_scope) === 0) _outOfScope = true;
+          } catch (e) {
+            this.warn('[euroffice.html] node-scope check unavailable (fail-open):', e && e.message);
+          }
+          if (_outOfScope) {
+            this.warn('[euroffice.html] node outside share subtree — denied');
+            return this.exception.unauthorized('Permission denied');
+          }
+        }
+        if (_caps.canEdit) mode = 'edit';
+      } catch (e) {
+        this.warn('[euroffice.html] share caps lookup failed:', e && e.message);
+      }
+    }
+    // Tamper-proof save-authorization for the (anonymous) save callback: it can't look
+    // up the recipient's per-recipient grant, so html signs the decision (canEdit +
+    // node identity + creator) with eo_secret. A view-only recipient's token says
+    // canEdit:false and can't be forged to true; expires so a stale token can't be
+    // replayed after access changes.
+    let _cdt = '';
+    if (_shareToken && _caps && _caps.valid) {
+      _cdt = Jwt.sign(
+        { nid, node_id: _caps.node_id, db_name: _caps.db_name, canEdit: !!_caps.canEdit, creator_id: _caps.creator_id },
+        eo_secret,
+        { expiresIn: '12h' }
+      );
+    }
+    // The session key is used by only office unique id for colaboration.
     const sessionKey = `${hub_id}.${nid}.${mtime}`;
 
     // Sign the sessionKey to ensure with wonn't be forged
@@ -71,7 +120,7 @@ class EurOffice extends Mfs {
       },
       editorConfig: {
         mode,
-        callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}`,
+        callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}${_cdt ? `&cdt=${encodeURIComponent(_cdt)}` : ''}`,
         user: {
           id: uid,
           name: fullname
@@ -129,6 +178,53 @@ class EurOffice extends Mfs {
       .createHmac('sha256', drumee_secret)
       .update(query)
       .digest('hex');
+  }
+
+  /**
+   * Resolve a secure-share token's capabilities + identity. Drives the editor mode
+   * (read-only unless can_edit), the node-scope check, and the save-as-creator write
+   * — so the editor never trusts the creator-bound session for the edit decision.
+   * Returns { valid, canEdit, node_id, hub_id, db_name, creator_id }.
+   */
+  async _secureShareCaps(token, email) {
+    const res = await this.yp.await_proc('secure_share_info', token);
+    const info = Array.isArray(res) ? res[0] : res;
+    if (!info || info.validity !== 'TICKET_OK') {
+      return { valid: false, canEdit: false };
+    }
+    // Base caps from the token — mirror dmz.js parsing (array | JSON string | enum).
+    let caps = [];
+    const rawCaps = info.capabilities;
+    if (Array.isArray(rawCaps)) caps = rawCaps.slice();
+    else if (typeof rawCaps === 'string') {
+      try { const p = JSON.parse(rawCaps); if (Array.isArray(p)) caps = p; } catch (e) {}
+    }
+    if (!caps.length && info.permission_level && info.permission_level !== 'can_view') {
+      caps = [info.permission_level];
+    }
+    // UNION the recipient's APPROVED per-recipient grants (keyed on email), exactly as
+    // dmz.js login does. An approval is stored as an access-request grant, NOT in the
+    // token's base caps — so without this the editor never sees a granted can_edit.
+    if (email) {
+      try {
+        const grants = toArray(await this.yp.await_proc('secure_share_get_access_grant', token, email));
+        for (const g of grants) {
+          String((g && g.granted_level) || '').split(',').map((s) => s.trim()).filter(Boolean)
+            .forEach((l) => { if (!caps.includes(l)) caps.push(l); });
+        }
+      } catch (e) {
+        this.warn('[euroffice] get_access_grant failed:', e && e.message);
+      }
+    }
+    const canEdit = caps.includes('can_edit');
+    return {
+      valid: true,
+      canEdit,
+      node_id: info.node_id,
+      hub_id: info.hub_id,
+      db_name: info.db_name,
+      creator_id: info.creator_id,
+    };
   }
 
   /**
@@ -225,8 +321,13 @@ class EurOffice extends Mfs {
   * @param {*} filter
   */
   async importFile(url, sessionKey, uid) {
-    let { node, db_name } = await this.getNode(sessionKey, uid, Permission.write)
-    if (!node) return
+    // NULL-GUARD before destructuring: getNode returns null when the uid lacks write
+    // on the node (e.g. a recipient's own uid) → destructuring null would crash the
+    // callback (was the euroffice.callback TypeError). The share save passes the
+    // creator's uid (handleClosure), so this normally finds the node.
+    const _res = await this.getNode(sessionKey, uid, Permission.write)
+    if (!_res || !_res.node) return
+    const { node, db_name } = _res
 
     const base = resolve(node.home_dir, node.nid)
     const outfile = resolve(base, `orig.${node.ext}`)
@@ -279,13 +380,17 @@ class EurOffice extends Mfs {
   /**
    * 
    */
-  async handleClosure(data) {
+  async handleClosure(data, overrideUid) {
     const { actions, notmodified, history, key, url } = data;
     if (notmodified) return;
     for (let action of actions) {
       switch (action.type) {
         case 0:
-          if (url) await this.importFile(url, key, action.userid);
+          // For a secure-share save, write as the share CREATOR (file owner) —
+          // the recipient's own uid has no ACL on the creator's node. overrideUid
+          // is set by callback() only after the share-token can_edit + node-scope
+          // checks pass; a normal desk save passes no overrideUid (action.userid).
+          if (url) await this.importFile(url, key, overrideUid || action.userid);
           break;
         case 1:
           this.debug("New user joining")
@@ -310,10 +415,36 @@ class EurOffice extends Mfs {
       this.exception.unauthorized("Invalid authorization token")
       return
     }
+    // Secure-share recipient SAVE gating. The callback is an anonymous doc-server
+    // call, so it can't look up the recipient's per-recipient grant — instead it
+    // verifies the tamper-proof decision token (cdt) html signed (eo_secret): a save
+    // (MustSave/MustForceSave) is only honored when cdt.canEdit is true AND the saved
+    // node matches the signed nid; the write is then performed as the share CREATOR.
+    // A normal desk save carries no cdt and is unaffected.
+    let _saveUid = null;
+    const _cdtRaw = this.input.use('cdt', null);
+    if (_cdtRaw && (data.status === 2 || data.status === 6)) {
+      let _d = null;
+      try { _d = Jwt.verify(_cdtRaw, eo_secret); }
+      catch (e) { this.warn('[euroffice.callback] cdt verify failed:', e && e.message); }
+      if (!_d || !_d.canEdit) {
+        this.warn('[euroffice.callback] save rejected: not editable per signed decision');
+        return this.output.json({ error: 0 });
+      }
+      // Confine the save to the node html signed. Both nids come from eo_secret-signed
+      // sources (data.key = doc-server token, _d.nid = html), so a crafted save with a
+      // different key is rejected.
+      const _nid = String(data.key || '').split('.')[1];
+      if (_nid && _d.nid && _nid !== _d.nid) {
+        this.warn('[euroffice.callback] save rejected: node mismatch');
+        return this.output.json({ error: 0 });
+      }
+      _saveUid = _d.creator_id || null;
+    }
     switch (data.status) {
       case 6: // MustForceSave (force save during editing)
       case 2: // MustSave (normal save after closing)
-        await this.handleClosure(data)
+        await this.handleClosure(data, _saveUid)
         break;
 
       case 3: // Corrupted (error during save)
@@ -343,11 +474,56 @@ class EurOffice extends Mfs {
   async new_doc() {
     const name = this.input.need(Attr.name);
     const { hub_id, nid: pid } = this.granted_node();
+    // Secure-share recipient: creating a document is a WRITE. When a share token is
+    // present, don't trust the session — require that the share grants can_edit and
+    // CONFINE the new doc's destination (pid) to the shared subtree. The copy then
+    // runs as the share CREATOR (file owner), exactly like the editor save path
+    // (handleClosure overrideUid): a signed-in recipient is bound to their OWN uid
+    // (dmz.js node-grant binding), so running as the creator guarantees the copy is
+    // authorized on the creator's folder and the new file is creator-owned (uniform
+    // with all share content). Desk requests carry no token → operate as this.uid,
+    // unchanged.
+    const _shareToken = this.input.use('token', null);
+    let _opUid = this.uid;
+    if (_shareToken) {
+      const _recipientEmail = String(((this.user && this.user.get(Attr.profile)) || {}).email || '').toLowerCase().trim() || null;
+      let _caps = null;
+      try {
+        _caps = await this._secureShareCaps(_shareToken, _recipientEmail);
+      } catch (e) {
+        this.warn('[euroffice.new_doc] share caps lookup failed:', e && e.message);
+        return this.exception.unauthorized('Permission denied');
+      }
+      if (!_caps || !_caps.valid || !_caps.canEdit) {
+        this.warn('[euroffice.new_doc] create denied: share does not grant can_edit');
+        return this.exception.unauthorized('Permission denied');
+      }
+      // Node-scope: the destination folder MUST be inside the shared subtree (a
+      // crafted foreign pid would otherwise resolve via the creator-bound session).
+      // Deny ONLY on a positive out-of-scope result; FAIL OPEN on any error (the SP
+      // may be absent on some instances → behave as today). Mirrors html().
+      if (_caps.node_id && _caps.db_name) {
+        let _outOfScope = false;
+        try {
+          const _r = await this.yp.await_proc(`${_caps.db_name}.mfs_node_in_subtree`, _caps.node_id, pid);
+          const _row = Array.isArray(_r) ? _r[0] : _r;
+          if (_row && Number(_row.in_scope) === 0) _outOfScope = true;
+        } catch (e) {
+          this.warn('[euroffice.new_doc] node-scope check unavailable (fail-open):', e && e.message);
+        }
+        if (_outOfScope) {
+          this.warn('[euroffice.new_doc] destination outside share subtree — denied');
+          return this.exception.unauthorized('Permission denied');
+        }
+      }
+      // Operate as the creator from here on (template read, copy, read-back).
+      if (_caps.creator_id) _opUid = _caps.creator_id;
+    }
     let { db_name, path } = JSON.parse(Cache.getSysConf('doc_templates'));
     let filepath = join(path, name);
-    let src = await this.yp.await_proc(`${db_name}.mfs_access_node`, this.uid, filepath)
+    let src = await this.yp.await_proc(`${db_name}.mfs_access_node`, _opUid, filepath)
     let source = [{ hub_id: src.hub_id, nid: src.nid }]
-    let data = await this.db.await_proc('mfs_copy_all', source, this.uid, pid, hub_id)
+    let data = await this.db.await_proc('mfs_copy_all', source, _opUid, pid, hub_id)
     let copied;
     for (let node of data) {
       switch (node.action) {
@@ -361,7 +537,7 @@ class EurOffice extends Mfs {
           }
           break;
         case "show":
-          copied = await this.db.await_proc("mfs_access_node", this.uid, node.nid)
+          copied = await this.db.await_proc("mfs_access_node", _opUid, node.nid)
           await this.sendNodeAttributes(copied, "media.new")
           break;
       }
