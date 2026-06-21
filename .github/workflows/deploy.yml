@@ -15,6 +15,9 @@ concurrency:
   group: cd-marketplace-${{ github.event.inputs.target || github.ref_name }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     name: Deploy
@@ -43,6 +46,9 @@ jobs:
             PROD) EP=main;    PORT=24000; BRANCH=preview; SRC=/usr/src/drumee/$PLUGIN;      MODE=runtime ;;
             *) echo "Unknown target: $TARGET"; exit 1 ;;
           esac
+          # loc=stage -> deploy locally on the runner host (drumee.in) `main` endpoint
+          # loc=container -> deploy into the prod box (sgp) docker container
+          LOC=container; [ "$TARGET" = "TEST" ] && LOC=stage
           {
             echo "target=$TARGET"
             echo "endpoint=$EP"
@@ -50,12 +56,58 @@ jobs:
             echo "branch=$BRANCH"
             echo "src=$SRC"
             echo "mode=$MODE"
+            echo "loc=$LOC"
             echo "runtime=/srv/drumee/runtime/plugins/server/$EP/$PLUGIN"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::Target $TARGET -> endpoint $EP (plugin $PLUGIN, branch $BRANCH)"
+          echo "::notice::Target $TARGET -> endpoint $EP (plugin $PLUGIN, branch $BRANCH, loc $LOC)"
+
+      # ---------------- TEST: deploy plugin to drumee.in (stage) `main` endpoint ----------------
+      - name: Deploy to stage main (TEST)
+        id: stage
+        if: steps.target.outputs.loc == 'stage'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_DIR: /usr/src/drumee/marketplace
+        run: |
+          set -euo pipefail
+          AUTH="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          [ -d "$REPO_DIR/.git" ] || sudo git init -q "$REPO_DIR"
+          PREV=$(sudo git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo "")
+          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
+          sudo git -C "$REPO_DIR" fetch --depth 1 "$AUTH" test
+          sudo git -C "$REPO_DIR" checkout -f -B test FETCH_HEAD
+          sudo git -C "$REPO_DIR" reset --hard FETCH_HEAD
+          sudo git -C "$REPO_DIR" clean -fd -e .dev-tools.rc || true
+          echo "Deploying $(sudo git -C "$REPO_DIR" rev-parse --short HEAD) plugin to stage main"
+          sudo bash -c "cd '$REPO_DIR' && npm install --no-audit --no-fund"
+          sudo bash -c "cd '$REPO_DIR' && npm run deploy -- deploy"
+          sudo /usr/sbin/drumee restart main/service
+
+      - name: Verify stage main (TEST)
+        if: steps.target.outputs.loc == 'stage'
+        run: |
+          set -euo pipefail
+          sleep 6
+          CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 -H 'Host: drumee.in' https://localhost/-/ || echo 000)
+          echo "stage main HTTP: $CODE"
+          [[ "$CODE" =~ ^[2-4][0-9][0-9]$ ]] || { echo "::error::stage main verify failed ($CODE)"; exit 1; }
+          echo "Verified stage main (marketplace plugin loaded)"
+
+      - name: Rollback stage (on failure)
+        if: failure() && steps.target.outputs.loc == 'stage' && steps.stage.outputs.prev != ''
+        env:
+          REPO_DIR: /usr/src/drumee/marketplace
+          PREV: ${{ steps.stage.outputs.prev }}
+        run: |
+          set -uo pipefail
+          echo "::warning::Rolling back stage marketplace to ${PREV:0:8}"
+          sudo git -C "$REPO_DIR" reset --hard "$PREV"
+          sudo bash -c "cd '$REPO_DIR' && npm run deploy -- deploy" || true
+          sudo /usr/sbin/drumee restart main/service || true
 
       - name: Fetch and reset working tree
         id: fetch
+        if: steps.target.outputs.loc == 'container'
         env:
           SRC: ${{ steps.target.outputs.src }}
           BRANCH: ${{ steps.target.outputs.branch }}
@@ -80,6 +132,7 @@ jobs:
           echo "Previous: ${PREV:0:8}  New: ${NEW:0:8}"
 
       - name: Install dependencies
+        if: steps.target.outputs.loc == 'container'
         env:
           SRC: ${{ steps.target.outputs.src }}
         run: |
@@ -107,6 +160,7 @@ jobs:
           EOSSH
 
       - name: Restart endpoint service
+        if: steps.target.outputs.loc == 'container'
         env:
           EP: ${{ steps.target.outputs.endpoint }}
         run: |
@@ -118,6 +172,7 @@ jobs:
           EOSSH
 
       - name: Verify HTTP
+        if: steps.target.outputs.loc == 'container'
         env:
           PORT: ${{ steps.target.outputs.port }}
           EP: ${{ steps.target.outputs.endpoint }}
@@ -134,7 +189,7 @@ jobs:
           EOSSH
 
       - name: Rollback (on failure)
-        if: failure() && steps.fetch.outputs.prev != ''
+        if: failure() && steps.target.outputs.loc == 'container' && steps.fetch.outputs.prev != ''
         env:
           SRC: ${{ steps.target.outputs.src }}
           EP: ${{ steps.target.outputs.endpoint }}
@@ -155,7 +210,7 @@ jobs:
           EOSSH
 
       - name: Cleanup
-        if: always()
+        if: always() && steps.target.outputs.loc == 'container'
         continue-on-error: true
         env:
           MODE: ${{ steps.target.outputs.mode }}
