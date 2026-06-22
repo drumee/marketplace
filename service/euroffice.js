@@ -106,8 +106,22 @@ class EurOffice extends Mfs {
     // Mode: for a share request the resolved node is the creator's (full priv), so
     // derive the mode from the token caps; otherwise from the node privilege.
     let mode = privilege & Permission.write ? 'edit' : 'view';
+    // Edit on a SHARE request requires a genuine signed-in recipient — never an
+    // anonymous opener. A public can_edit link otherwise hands edit to any visitor,
+    // and the save callback runs as the creator (the recipient is creator-bound).
+    // `signed_in` alone is unsafe: a creator-bound anon session reads as signed-in
+    // (session_check_cookie keys it off the bound entity = the creator, a real user).
+    // So require BOTH a real (non-nobody) identity AND that the opener's uid differs
+    // from the creator's. This covers both anonymous cases — no session (uid=nobody,
+    // signed_in=0, isAnonymous) and creator-bound (uid===creator_id) — while still
+    // allowing a genuine recipient (rebound to their own uid). Fails closed.
+    const _isAnon = !this.user || (typeof this.user.isAnonymous === 'function' && this.user.isAnonymous());
+    const _realIdentity = (this.user && this.user.get('signed_in') == 1) || !_isAnon;
+    const _distinctFromCreator = !!(_caps && _caps.creator_id && String(this.uid) !== String(_caps.creator_id));
+    const _editAllowed = !!(_caps && _caps.canEdit && _realIdentity && _distinctFromCreator);
     if (_shareToken) {
-      mode = (_caps && _caps.canEdit) ? 'edit' : 'view';
+      mode = _editAllowed ? 'edit' : 'view';
+      this.debug(`[euroffice.html][share] uid=${this.uid} signed_in=${this.user && this.user.get('signed_in')} anon=${_isAnon} creator=${_caps && _caps.creator_id} capsEdit=${_caps && _caps.canEdit} distinct=${_distinctFromCreator} -> editAllowed=${_editAllowed} mode=${mode}`);
     }
     // The content fetch (euroffice.read) and save must run as the file OWNER. For a
     // share request the recipient session isn't authorized on the node, so sign the
@@ -122,7 +136,7 @@ class EurOffice extends Mfs {
     let _cdt = '';
     if (_shareToken && _caps && _caps.valid) {
       _cdt = Jwt.sign(
-        { nid, node_id: _caps.node_id, db_name: _caps.db_name, canEdit: !!_caps.canEdit, creator_id: _caps.creator_id },
+        { nid, node_id: _caps.node_id, db_name: _caps.db_name, canEdit: _editAllowed, creator_id: _caps.creator_id },
         eo_secret,
         { expiresIn: '12h' }
       );
