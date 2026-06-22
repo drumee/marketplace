@@ -87,8 +87,21 @@ class EurOffice extends Mfs {
         this.warn('[euroffice.html] share caps/node lookup failed:', e && e.message);
       }
     }
-    // Desk / non-token request, or token resolution unavailable → session ACL.
-    if (!_node) _node = this.granted_node();
+    // Desk / non-token request (an authenticated user opening their own doc), or a
+    // token request that didn't resolve: resolve via the SESSION uid on the request's
+    // hub DB and deny without read access. We can't use granted_node here — the
+    // euroffice.html ACL is now public-api (so anonymous share recipients can reach this
+    // method at all), which means the ACL hasn't pre-resolved the mfs context.
+    if (!_node) {
+      const _hubId = this.input.use(Attr.hub_id);
+      const _inNid = this.input.use(Attr.nid);
+      const _db = _hubId ? await this.yp.await_func('get_db_name', _hubId) : null;
+      if (_db && _inNid) {
+        const _n = await this.yp.await_proc(`${_db}.mfs_access_node`, this.uid, _inNid);
+        if (_n && _n.privilege && (_n.privilege & Permission.read)) _node = _n;
+      }
+    }
+    if (!_node) return this.exception.unauthorized('Permission denied');
     const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = _node;
     // Mode: for a share request the resolved node is the creator's (full priv), so
     // derive the mode from the token caps; otherwise from the node privilege.

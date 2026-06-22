@@ -4,7 +4,8 @@
       "doc": "Send a html page with preset to load document using onlyoffice document server",
       "scope": "hub",
       "permission": {
-        "src": "read"
+        "src": "anonymous",
+        "fast_check": "public-api"
       },
       "params": {
         "nid": {
