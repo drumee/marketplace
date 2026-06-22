@@ -45,29 +45,30 @@ class EurOffice extends Mfs {
    */
   async html(src) {
     const uid = this.uid;
-    const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = src || this.granted_node();
-    let mode = privilege & Permission.write ? 'edit' : 'view';
-    // Secure-share recipient: derive the editor mode from the SHARE TOKEN's caps
-    // (the session is creator-bound = full priv, so `mode` above is unreliable) and
-    // CONFINE the opened node to the shared subtree. Read-only unless the share
-    // grants can_edit; the SAVE callback additionally re-checks can_edit and writes
-    // as the share creator. Desk/normal editor requests carry no token → unaffected.
+    // Secure-share recipient: derive everything from the SHARE TOKEN, not the session.
+    // The editor iframe does NOT carry an authorized session for an ANONYMOUS recipient
+    // (the share/guest cookie isn't sent cross-site to the editor endpoint), so
+    // this.granted_node() throws "Insufficient privilege". Resolve the node AS THE SHARE
+    // CREATOR (the file owner) via the token, node-scoped to the shared subtree.
+    // Read-only unless the share grants can_edit; the SAVE callback re-checks can_edit
+    // and writes as the creator. Desk/normal requests carry no token → granted_node.
     const _shareToken = this.input.use('token', null);
     // The recipient's email — the key for per-recipient approved grants (mirror
     // dmz.js: authenticated → user.profile.email, lowercased/trimmed).
     const _recipientEmail = String(((this.user && this.user.get(Attr.profile)) || {}).email || '').toLowerCase().trim() || null;
     let _caps = null;
-    if (_shareToken) {
-      mode = 'view';
+    let _node = src || null;
+    if (!_node && _shareToken) {
       try {
         _caps = await this._secureShareCaps(_shareToken, _recipientEmail);
-        if (_caps.valid && _caps.node_id && _caps.db_name) {
+        if (_caps && _caps.valid && _caps.creator_id && _caps.db_name) {
+          const _inNid = this.input.use(Attr.nid);
           // Node-scope: deny opening a node outside the shared subtree (a crafted
-          // foreign nid would otherwise resolve via the creator-bound session).
-          // Deny ONLY on a positive out-of-scope result; FAIL OPEN on any error.
+          // foreign nid would otherwise resolve via the creator). Deny ONLY on a
+          // positive out-of-scope result; FAIL OPEN on any error.
           let _outOfScope = false;
           try {
-            const _r = await this.yp.await_proc(`${_caps.db_name}.mfs_node_in_subtree`, _caps.node_id, nid);
+            const _r = await this.yp.await_proc(`${_caps.db_name}.mfs_node_in_subtree`, _caps.node_id, _inNid);
             const _row = Array.isArray(_r) ? _r[0] : _r;
             if (_row && Number(_row.in_scope) === 0) _outOfScope = true;
           } catch (e) {
@@ -77,12 +78,29 @@ class EurOffice extends Mfs {
             this.warn('[euroffice.html] node outside share subtree — denied');
             return this.exception.unauthorized('Permission denied');
           }
+          // Resolve the document as the CREATOR — the recipient session may be
+          // unauthorized at the editor endpoint. Returns the same fields granted_node
+          // would (hub_id/nid/filename/extension/privilege/mtime).
+          _node = await this.yp.await_proc(`${_caps.db_name}.mfs_access_node`, _caps.creator_id, _inNid);
         }
-        if (_caps.canEdit) mode = 'edit';
       } catch (e) {
-        this.warn('[euroffice.html] share caps lookup failed:', e && e.message);
+        this.warn('[euroffice.html] share caps/node lookup failed:', e && e.message);
       }
     }
+    // Desk / non-token request, or token resolution unavailable → session ACL.
+    if (!_node) _node = this.granted_node();
+    const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = _node;
+    // Mode: for a share request the resolved node is the creator's (full priv), so
+    // derive the mode from the token caps; otherwise from the node privilege.
+    let mode = privilege & Permission.write ? 'edit' : 'view';
+    if (_shareToken) {
+      mode = (_caps && _caps.canEdit) ? 'edit' : 'view';
+    }
+    // The content fetch (euroffice.read) and save must run as the file OWNER. For a
+    // share request the recipient session isn't authorized on the node, so sign the
+    // read URL with the CREATOR's uid; the editor's *displayed* user stays `uid`.
+    const _ownerUid = (_shareToken && _caps && _caps.valid && _caps.creator_id)
+      ? _caps.creator_id : this.uid;
     // Tamper-proof save-authorization for the (anonymous) save callback: it can't look
     // up the recipient's per-recipient grant, so html signs the decision (canEdit +
     // node identity + creator) with eo_secret. A view-only recipient's token says
@@ -99,13 +117,18 @@ class EurOffice extends Mfs {
     // The session key is used by only office unique id for colaboration.
     const sessionKey = `${hub_id}.${nid}.${mtime}`;
 
-    // Sign the sessionKey to ensure with wonn't be forged
-    const signature = this.signString(`${sessionKey}/${this.uid}`);
+    // Sign the sessionKey to ensure with wonn't be forged. Use the OWNER uid (creator
+    // for a share request) so euroffice.read resolves the content as the file owner.
+    const signature = this.signString(`${sessionKey}/${_ownerUid}`);
 
-    let query = `signature=${signature}&sessionKey=${sessionKey}&uid=${this.uid}`;
+    let query = `signature=${signature}&sessionKey=${sessionKey}&uid=${_ownerUid}`;
 
-    // Get user info
-    const fullname = this.user.get(Attr.fullname) || this.user.get(Attr.profile).email;
+    // Get user info. Guard the profile read — an anonymous share recipient has no
+    // profile (this path is now reachable for anonymous, which previously failed at
+    // granted_node before this line).
+    const fullname = this.user.get(Attr.fullname)
+      || ((this.user.get(Attr.profile) || {}).email)
+      || 'Guest';
 
     // Map the app theme forwarded by the frontend onto the OnlyOffice uiTheme.
     const uiTheme = this.input.use('theme', 'light') === 'dark' ? 'theme-dark' : 'theme-light';
