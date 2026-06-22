@@ -121,7 +121,6 @@ class EurOffice extends Mfs {
     const _editAllowed = !!(_caps && _caps.canEdit && _signedIn && _distinctFromCreator);
     if (_shareToken) {
       mode = _editAllowed ? 'edit' : 'view';
-      this.debug(`[euroffice.html][share] uid=${this.uid} signed_in=${this.user && this.user.get('signed_in')} creator=${_caps && _caps.creator_id} capsEdit=${_caps && _caps.canEdit} distinct=${_distinctFromCreator} -> editAllowed=${_editAllowed} mode=${mode}`);
     }
     // The content fetch (euroffice.read) and save must run as the file OWNER. For a
     // share request the recipient session isn't authorized on the node, so sign the
