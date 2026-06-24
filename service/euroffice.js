@@ -118,7 +118,31 @@ class EurOffice extends Mfs {
     //  in the worker context and it throws.)
     const _signedIn = !!(this.user && this.user.get('signed_in') == 1);
     const _distinctFromCreator = !!(_caps && _caps.creator_id && String(this.uid) !== String(_caps.creator_id));
-    const _editAllowed = !!(_caps && _caps.canEdit && _signedIn && _distinctFromCreator);
+    // Genuine OWNER opening their own link: dmz.login signs a short-lived
+    // owner_edit_token (with the shared `drumee` secret) ONLY for an authenticated
+    // owner (is_authenticated && uid===creator). Verifying it lets the creator follow
+    // the link's edit permission WITHOUT weakening the anonymous block above — an
+    // anonymous creator-bound session never receives a valid token and cannot forge
+    // one (server-signed), so it still resolves to view-only here. Bound to THIS share
+    // (token + creator) and short-lived, so it cannot be replayed for another share.
+    let _verifiedOwner = false;
+    const _otoken = this.input.use('otoken', null);
+    if (_otoken && _caps && _caps.valid && _caps.creator_id) {
+      try {
+        const _o = Jwt.verify(_otoken, drumee_secret);
+        if (_o && _o.kind === 'ss_owner'
+          && String(_o.token) === String(_shareToken)
+          && String(_o.owner_uid) === String(_caps.creator_id)) {
+          _verifiedOwner = true;
+        }
+      } catch (e) {
+        this.warn('[euroffice.html] owner token verify failed:', e && e.message);
+      }
+    }
+    // Edit iff the link grants it AND the opener is either a genuine signed-in
+    // recipient (distinct from the creator) OR the cryptographically-verified owner.
+    // On a view-only link canEdit is false → view for everyone (faithful preview).
+    const _editAllowed = !!(_caps && _caps.canEdit && ((_signedIn && _distinctFromCreator) || _verifiedOwner));
     if (_shareToken) {
       mode = _editAllowed ? 'edit' : 'view';
     }
