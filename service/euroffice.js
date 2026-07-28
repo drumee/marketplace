@@ -10,6 +10,7 @@ const {
   MfsTools
 } = require("@drumee/server-core");
 const { move_node, copy_node } = MfsTools;
+const { stashCurrent, commitVersion } = require('./lib/versioning');
 const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync } = require('jsonfile');
@@ -405,6 +406,12 @@ class EurOffice extends Mfs {
     const base = resolve(node.home_dir, node.nid)
     const outfile = resolve(base, `orig.${node.ext}`)
     this.debug(`Downloading ${this.input.get(Attr.url)} => ${outfile}.`);
+    // Preserve the bytes that are about to be overwritten. It has to happen
+    // BEFORE the download — afterwards the previous content is gone — while
+    // whether it is worth keeping is only known once the new md5 is in hand.
+    // commitVersion below decides, and discards the stash when nothing changed.
+    const pendingVersion = await stashCurrent(node);
+    const previousSize = node.filesize;
     let opt = {
       method: 'GET',
       outfile,
@@ -412,6 +419,10 @@ class EurOffice extends Mfs {
     };
     let res = await Network.request(opt);
     let { md5Hash } = res;
+    await commitVersion(this, {
+      node, db_name, pending: pendingVersion, newMd5: md5Hash, uid,
+      oldSize: previousSize,
+    });
     if (node.metadata) {
       if (isString(node.metadata)) {
         node.metadata = JSON.parse(node.metadata)

@@ -9,6 +9,7 @@ const {
   Mfs,
   MfsTools
 } = require("@drumee/server-core");
+const { stashCurrent, commitVersion } = require('./lib/versioning');
 const { move_node, copy_node } = MfsTools;
 const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
@@ -216,6 +217,11 @@ class OnlyOffice extends Mfs {
     const base = resolve(node.home_dir, node.nid)
     const outfile = resolve(base, `orig.${node.ext}`)
     this.debug(`Downloading ${this.input.get(Attr.url)} => ${outfile}.`);
+    // See euroffice.importFile: stash the current bytes before the download
+    // overwrites them, then let commitVersion keep or discard the stash once
+    // the new md5 says whether anything actually changed.
+    const pendingVersion = await stashCurrent(node);
+    const previousSize = node.filesize;
     let opt = {
       method: 'GET',
       outfile,
@@ -223,6 +229,10 @@ class OnlyOffice extends Mfs {
     };
     let res = await Network.request(opt);
     let { md5Hash } = res;
+    await commitVersion(this, {
+      node, db_name, pending: pendingVersion, newMd5: md5Hash, uid,
+      oldSize: previousSize,
+    });
     if (node.metadata) {
       if (isString(node.metadata)) {
         node.metadata = JSON.parse(node.metadata)
