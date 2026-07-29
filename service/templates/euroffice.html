@@ -32,11 +32,21 @@
       onRequestEditRights: function () {
         try {
           // The payload carries no identifier and no secret — only "the viewer asked
-          // to edit" — so a wildcard target is safe here. The Drumee parent validates
+          // to edit" — so a wildcard target is safe here. The Drumee page validates
           // the sender origin against the editor URL before acting on the message.
-          if (window.parent) {
-            window.parent.postMessage({ event: "drumee:requestEditRights" }, "*");
-          }
+          //
+          // Posts to window.top AND window.parent: `parent` is only the Drumee page
+          // when this document is exactly one frame deep, which is not guaranteed,
+          // while `top` is the outermost window in every nesting. Both are sent
+          // because either one alone can be the wrong target; the Drumee side
+          // de-duplicates, so a double delivery opens a single dialog.
+          var msg = { event: "drumee:requestEditRights" };
+          var sent = [];
+          [window.top, window.parent].forEach(function (w) {
+            if (!w || w === window || sent.indexOf(w) !== -1) return;
+            sent.push(w);
+            try { w.postMessage(msg, "*"); } catch (err) { /* keep trying the other */ }
+          });
         } catch (e) {
           // Never let a messaging failure break the editor; it stays read-only.
         }
