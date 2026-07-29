@@ -234,17 +234,6 @@ class EurOffice extends Mfs {
     // Add token to config sent to frontend
     confObject.token = token;
 
-    // Template-only flag, set AFTER Jwt.sign so the SIGNED payload is byte-identical
-    // to before. When a secure-share recipient lands in the forced read-only editor,
-    // register OnlyOffice's onRequestEditRights handler: api.js turns the presence of
-    // that handler into editorConfig.canRequestEditRights, which is what makes the
-    // editor offer "Edit document" in view mode. Clicking it posts a message to the
-    // Drumee parent, which opens the share's Request Access / sign-up flow — the
-    // recipient previously had no way to ask for edit rights from inside the editor.
-    // Scoped to `_shareToken && mode === 'view'`, so a normal desk request (no token)
-    // and any writable editor are completely unchanged.
-    confObject.shareEditRequest = !!(_shareToken && mode === 'view');
-
     this.sendHtml(confObject)
   }
 

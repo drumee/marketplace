@@ -21,27 +21,7 @@
         uiTheme: "<%= editorConfig.customization.uiTheme %>"
       }
     },
-    documentServerUrl: "<%= documentServerUrl %>",<% if (typeof shareEditRequest !== 'undefined' && shareEditRequest) { %>
-    // Secure-share recipient in the forced read-only editor. api.js derives
-    // editorConfig.canRequestEditRights from the mere PRESENCE of this handler, and
-    // that flag is what makes OnlyOffice offer "Edit document" in view mode. Tell the
-    // Drumee parent so it can open the share's Request Access / sign-up flow, then
-    // leave the document read-only: edit permission is decided server-side from the
-    // share token, so this handler must never grant rights itself.
-    events: {
-      onRequestEditRights: function () {
-        try {
-          // The payload carries no identifier and no secret — only "the viewer asked
-          // to edit" — so a wildcard target is safe here. The Drumee parent validates
-          // the sender origin against the editor URL before acting on the message.
-          if (window.parent) {
-            window.parent.postMessage({ event: "drumee:requestEditRights" }, "*");
-          }
-        } catch (e) {
-          // Never let a messaging failure break the editor; it stays read-only.
-        }
-      }
-    },<% } %>
+    documentServerUrl: "<%= documentServerUrl %>",
     token: "<%= token %>"
   }
   const docEditor = new DocsAPI.DocEditor("editor-<%= editorConfig.user.id %>", config); 
