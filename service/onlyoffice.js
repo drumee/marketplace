@@ -13,6 +13,7 @@ const { move_node, copy_node } = MfsTools;
 const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync } = require('jsonfile');
+const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
 const { onlyoffice: oo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
@@ -69,7 +70,7 @@ class OnlyOffice extends Mfs {
         url: `${this.input.homepath()}svc/onlyoffice.read?${query}`
       },
       editorConfig: {
-        mode: privilege & Permission.write ? 'edit' : 'view',
+        mode: privilege & PERMISSION_WRITE ? 'edit' : 'view',
         callbackUrl: `${this.input.homepath()}svc/onlyoffice.callback?key=${sessionKey}`,
         user: {
           id: uid,
@@ -210,7 +211,7 @@ class OnlyOffice extends Mfs {
   * @param {*} filter
   */
   async importFile(url, sessionKey, uid) {
-    let { node, db_name } = await this.getNode(sessionKey, uid, Permission.write)
+    let { node, db_name } = await this.getNode(sessionKey, uid, PERMISSION_WRITE)
     if (!node) return
 
     const base = resolve(node.home_dir, node.nid)

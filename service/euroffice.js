@@ -13,6 +13,7 @@ const { move_node, copy_node } = MfsTools;
 const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync } = require('jsonfile');
+const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
 const { EurOffice: eo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
@@ -105,7 +106,7 @@ class EurOffice extends Mfs {
     const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = _node;
     // Mode: for a share request the resolved node is the creator's (full priv), so
     // derive the mode from the token caps; otherwise from the node privilege.
-    let mode = privilege & Permission.write ? 'edit' : 'view';
+    let mode = privilege & PERMISSION_WRITE ? 'edit' : 'view';
     // Edit on a SHARE request requires a genuine signed-in recipient — never an
     // anonymous opener. A public can_edit link otherwise hands edit to any visitor,
     // and the save callback runs as the creator (the recipient is creator-bound).
@@ -410,7 +411,7 @@ class EurOffice extends Mfs {
     // on the node (e.g. a recipient's own uid) → destructuring null would crash the
     // callback (was the euroffice.callback TypeError). The share save passes the
     // creator's uid (handleClosure), so this normally finds the node.
-    const _res = await this.getNode(sessionKey, uid, Permission.write)
+    const _res = await this.getNode(sessionKey, uid, PERMISSION_WRITE)
     if (!_res || !_res.node) return
     const { node, db_name } = _res
 
