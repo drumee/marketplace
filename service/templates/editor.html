@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title><%- document.title %></title>
+  <style>
+    /*
+      Served as a bare fragment before — no doctype, no <html>/<head>, no CSS —
+      which put the browser in quirks mode and left the UA defaults in force.
+
+      DocsAPI.DocEditor REPLACES the placeholder <div> with its own
+      <iframe width="100%" height="100%">, so it lands as a direct child of
+      <body>: inset 8px on every side by the body margin, and, being inline,
+      reserving ~4px of baseline descender beneath itself. The editor was laid
+      out ~20px taller and ~16px wider than the frame that had to hold it, with
+      the overflow falling outside the fold.
+
+      That lost strip is exactly the spreadsheet status bar (sheet tabs and the
+      "+" add-sheet button, drawn but off-screen), the right panel's collapse
+      rail (the only way to close it), and the horizontal scrollbar a page wider
+      than the window needs — which is why such a page read as cropped rather
+      than scrollable.
+
+      A definite height on the html/body chain, no margin, and a block-level
+      editor iframe give the document server the box we mean it to have.
+    */
+    html,
+    body {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+
+    /*
+      Both selectors on purpose. Depending on the document server build, api.js
+      either replaces the placeholder with its iframe (so the iframe is a child
+      of <body>) or appends the iframe inside it — this sizes the editor either
+      way, and `display: block` is what removes the inline baseline gap.
+    */
+    #<%= placeholderId %>,
+    iframe {
+      display: block;
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="<%= placeholderId %>"></div>
+  <script type="text/javascript" src="<%= documentServerUrl %>/web-apps/apps/api/documents/api.js"></script>
+  <script type="text/javascript">
+    // The config is emitted verbatim from the object the server signed, rather
+    // than re-listed field by field. The hand-copied version silently dropped
+    // whatever the list forgot — that is how `customization.forcesave` never
+    // reached the browser and left the Save button inert — and every field it
+    // did copy was a chance for the config and the JWT to disagree.
+    var config = <%= configJson %>;
+    var docEditor = new DocsAPI.DocEditor("<%= placeholderId %>", config);
+  </script>
+</body>
+
+</html>

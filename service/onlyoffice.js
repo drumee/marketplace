@@ -2,7 +2,7 @@ const { resolve, join } = require('path');
 const {
   RedisStore, sysEnv, Attr, Permission, Constants, Network, toArray, Cache
 } = require('@drumee/server-essentials');
-const { template, isString } = require('lodash');
+const { isString } = require('lodash');
 const Jwt = require('jsonwebtoken'); // Make sure this is installed
 const {
   Document,
@@ -14,14 +14,13 @@ const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync } = require('jsonfile');
 const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
+const { buildEditorConfig } = require("./lib/editor-config");
+const { renderEditorPage } = require("./lib/editor-page");
 const { onlyoffice: oo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
 } = Constants;
 
-const {
-  readFileSync: readFile,
-} = require("fs");
 
 class OnlyOffice extends Mfs {
 
@@ -30,10 +29,11 @@ class OnlyOffice extends Mfs {
  */
   async sendHtml(data) {
     const { main_domain } = sysEnv()
-    const tpl = resolve(__dirname, 'templates/onlyoffice.html');
-    let html = readFile(tpl);
-    html = String(html).trim().toString();
-    const content = template(html)(data);
+    // This used to read `templates/onlyoffice.html`, a file that does not exist
+    // in the repository — so whenever the `doc_editor` sysconf named this service
+    // rather than euroffice, every open threw ENOENT here. Both services now
+    // render the one shared template.
+    const content = renderEditorPage(data);
 
     this.output.set_header("Access-Control-Allow-Origin", `*.${main_domain}`);
     this.output.set_header("Pragma", "no-cache");
@@ -46,6 +46,7 @@ class OnlyOffice extends Mfs {
   async html() {
     const uid = this.uid;
     const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = this.granted_node();
+    const mode = privilege & PERMISSION_WRITE ? 'edit' : 'view';
 
     // The session key is used by only office unique id for colaboration. 
     const sessionKey = `${hub_id}.${nid}.${mtime}`;
@@ -61,35 +62,30 @@ class OnlyOffice extends Mfs {
     // Map the app theme forwarded by the frontend onto the OnlyOffice uiTheme.
     const uiTheme = this.input.use('theme', 'light') === 'dark' ? 'theme-dark' : 'theme-light';
 
-    // Return the configuration
-    const confObject = {
-      document: {
-        fileType: extension,
-        key: sessionKey,
-        title: filename,
-        url: `${this.input.homepath()}svc/onlyoffice.read?${query}`
-      },
-      editorConfig: {
-        mode: privilege & PERMISSION_WRITE ? 'edit' : 'view',
-        callbackUrl: `${this.input.homepath()}svc/onlyoffice.callback?key=${sessionKey}`,
-        user: {
-          id: uid,
-          name: fullname
-        },
-        customization: {
-          uiTheme
-        }
-      },
-      customization: {
-        forcesave: true,  // Enable Save button and intermediate versions
-      },
-      // Your custom Drumee data
-      drumeeContext: {
-        nid,
-        hub_id
-      },
-      documentServerUrl: Cache.getSysConf('documentServerUrl')
-    };
+    // Editor UI language, same as the euroffice path. The desk forwards &lang=
+    // on the iframe URL for whichever service `doc_editor` names; this service
+    // used to ignore it, so the editor chrome fell back to the document
+    // server's own default language.
+    const uiLang = this.input.use('lang', '')
+      || ((this.user && this.user.get(Attr.profile)) || {}).lang;
+
+    // Return the configuration. Shared with the euroffice service so both
+    // editors are configured identically — see lib/editor-config.
+    const confObject = buildEditorConfig({
+      extension,
+      filename,
+      sessionKey,
+      mode,
+      uid,
+      fullname,
+      uiTheme,
+      lang: uiLang,
+      readUrl: `${this.input.homepath()}svc/onlyoffice.read?${query}`,
+      callbackUrl: `${this.input.homepath()}svc/onlyoffice.callback?key=${sessionKey}`,
+      nid,
+      hub_id,
+      documentServerUrl: Cache.getSysConf('documentServerUrl'),
+    });
 
     // Sign the ENTIRE config as the token
     const token = Jwt.sign(
