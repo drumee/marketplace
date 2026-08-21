@@ -149,6 +149,33 @@ check('no session or query language can change it', () => {
   assert.strictEqual(buildConfig({ lang: undefined }).editorConfig.lang, 'en');
 });
 
+console.log('\nFile-menu integrations (Save Copy as…, Rename)');
+const INTEGRATION = {
+  nid: 'node1',
+  hub_id: 'hub1',
+  ext: 'docx',
+  docKey: 'hub1.node1.1700000000',
+  saveAsUrl: 'https://host/-/svc/euroffice.save_as',
+  renameUrl: 'https://host/-/svc/media.rename',
+  retitleUrl: 'https://host/-/svc/euroffice.retitle',
+};
+check('an edit session page wires both editor events', () => {
+  const html = renderEditorPage(buildConfig(), INTEGRATION);
+  assert.ok(/onRequestSaveAs/.test(html));
+  assert.ok(/onRequestRename/.test(html));
+  assert.ok(/euroffice\.save_as/.test(html));
+  assert.ok(/media\.rename/.test(html));
+});
+check('without an integration block the page declares no events', () => {
+  const html = renderEditorPage(buildConfig());
+  assert.ok(!/onRequestSaveAs/.test(html));
+  assert.ok(!/config\.events/.test(html));
+});
+check('the signed config itself never carries events', () => {
+  const config = buildConfig();
+  assert.strictEqual(config.events, undefined);
+});
+
 console.log('\nboth services are configured by the same builder');
 check('euroffice and onlyoffice call buildEditorConfig, not a local literal', () => {
   const fs = require('fs');

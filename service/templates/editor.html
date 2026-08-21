@@ -65,6 +65,65 @@
     // reached the browser and left the Save button inert — and every field it
     // did copy was a chance for the config and the JWT to disagree.
     var config = <%= configJson %>;
+    <% if (integrationJson) { %>
+    // Drumee menu integrations — "Save Copy as…" and in-editor Rename. The
+    // editor only offers these File-menu items when a handler exists. Handlers
+    // are functions, so they live OUTSIDE the signed config (JSON.stringify
+    // drops them; the token stays valid) and call back into the same-origin
+    // Drumee services with this page's session cookies.
+    var drumee = <%= integrationJson %>;
+    var post = function (url, body) {
+      return fetch(url, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    };
+    config.events = {
+      // The document server hands us a download URL of the copy it assembled;
+      // the service pulls it and creates the file beside the original.
+      onRequestSaveAs: function (e) {
+        var d = (e && e.data) || {};
+        post(drumee.saveAsUrl, {
+          nid: drumee.nid,
+          hub_id: drumee.hub_id,
+          url: d.url,
+          title: d.title,
+          file_type: d.fileType
+        }).then(function (r) {
+          if (window.docEditor && docEditor.showMessage) {
+            docEditor.showMessage(r.ok
+              ? 'A copy was saved next to the original document'
+              : 'Could not save the copy');
+          }
+        }).catch(function (err) { console.error('saveAs failed', err); });
+      },
+      // Rename in storage through the platform service (name dedup, live
+      // updates), then mirror the title into the running editor session so
+      // every open tab retitles without a reopen.
+      onRequestRename: function (e) {
+        var title = String((e && e.data) || '').trim();
+        if (!title) return;
+        var ext = '.' + drumee.ext;
+        if (title.toLowerCase().slice(-ext.length) === ext.toLowerCase()) {
+          title = title.slice(0, -ext.length).trim();
+        }
+        if (!title) return;
+        post(drumee.renameUrl, { nid: drumee.nid, hub_id: drumee.hub_id, filename: title })
+          .then(function (r) {
+            if (!r.ok) throw new Error('rename HTTP ' + r.status);
+            return post(drumee.retitleUrl, {
+              nid: drumee.nid,
+              hub_id: drumee.hub_id,
+              key: drumee.docKey,
+              title: title + ext
+            });
+          })
+          .catch(function (err) { console.error('rename failed', err); });
+      }
+    };
+    <% } %>
     var docEditor = new DocsAPI.DocEditor("<%= placeholderId %>", config);
   </script>
 </body>

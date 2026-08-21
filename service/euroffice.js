@@ -16,6 +16,7 @@ const { readFileSync } = require('jsonfile');
 const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
 const { buildEditorConfig } = require("./lib/editor-config");
 const { renderEditorPage } = require("./lib/editor-page");
+const { sendDsCommand } = require("./lib/ds-command");
 const { EurOffice: eo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
@@ -27,9 +28,9 @@ class EurOffice extends Mfs {
   /**
  *
  */
-  async sendHtml(data) {
+  async sendHtml(data, integration = null) {
     const { main_domain } = sysEnv()
-    const content = renderEditorPage(data);
+    const content = renderEditorPage(data, integration);
 
     // "*.domain" is not a valid Allow-Origin value; echo the caller's origin
     // when it belongs to this deployment (hub subdomains included).
@@ -213,7 +214,22 @@ class EurOffice extends Mfs {
     // Add token to config sent to frontend
     confObject.token = token;
 
-    this.sendHtml(confObject)
+    // File-menu integrations (Save Copy as…, Rename) — desk edit sessions only:
+    // a share session is creator-bound and routes writes through signed grants,
+    // which neither integration carries yet.
+    let integration = null;
+    if (mode === 'edit' && !_shareToken) {
+      integration = {
+        nid,
+        hub_id,
+        ext: extension,
+        docKey: sessionKey,
+        saveAsUrl: `${this.input.homepath()}svc/euroffice.save_as`,
+        renameUrl: `${this.input.homepath()}svc/media.rename`,
+        retitleUrl: `${this.input.homepath()}svc/euroffice.retitle`,
+      };
+    }
+    this.sendHtml(confObject, integration)
   }
 
   /**
@@ -609,6 +625,113 @@ class EurOffice extends Mfs {
       }
     }
     this.output.data(copied)
+  }
+
+  /**
+   * "Save Copy as…" — the editor hands us the download URL of the copy it just
+   * assembled; create a sibling of the source document and fill it with that
+   * content. v1 keeps the copy in the source's own format (no conversion).
+   */
+  async save_as() {
+    const granted = this.granted_node();
+    const node = await this.db.await_proc('mfs_access_node', this.uid, granted.nid);
+    if (!node || !node.nid) return this.exception.unauthorized('Permission denied');
+    const { hub_id } = node;
+    const pid = node.parent_id || node.pid;
+
+    const srcUrl = String(this.input.need(Attr.url));
+    const title = String(this.input.need('title') || '').trim();
+    const ext = String(node.ext || '').toLowerCase();
+    const fileType = String(this.input.use('file_type', ext) || ext).toLowerCase();
+
+    // The only host this service will ever fetch is the document server itself.
+    let parsed = null;
+    try { parsed = new URL(srcUrl); } catch (e) { /* refused below */ }
+    const dsBase = Cache.getSysConf('eurofficeServerUrl');
+    if (!parsed || !dsBase || parsed.origin !== new URL(dsBase).origin) {
+      this.warn('[euroffice.save_as] refused a url outside the document server');
+      return this.exception.unauthorized('Permission denied');
+    }
+    if (fileType !== ext) return this.exception.user('UNSUPPORTED_FORMAT');
+    if (!title || /[\/\\]/.test(title) || /^\.+$/.test(title)) {
+      return this.exception.user('INVALID_FILENAME');
+    }
+
+    // A sibling copy of the source node — same recipe as new_doc's template copy.
+    const data = await this.db.await_proc('mfs_copy_all', [{ hub_id, nid: node.nid }], this.uid, pid, hub_id);
+    let copied = null;
+    for (let n of data) {
+      switch (n.action) {
+        case 'copy':
+          try {
+            copy_node({ nid: n.nid, mfs_root: n.src_mfs_root }, { nid: n.des_id, mfs_root: n.des_mfs_root }, 0);
+          } catch (e) {
+            this.warn('COPY FAILED ', e);
+          }
+          break;
+        case 'show':
+          copied = await this.db.await_proc('mfs_access_node', this.uid, n.nid);
+          break;
+      }
+    }
+    if (!copied || !copied.nid) return this.exception.user('COPY_FAILED');
+
+    // Name the copy as asked (the proc de-duplicates), then overwrite its
+    // content with the state the editor handed us — the importFile steps.
+    let base = title;
+    const suffix = `.${ext}`;
+    if (base.toLowerCase().endsWith(suffix)) {
+      base = base.slice(0, -suffix.length).trim() || title;
+    }
+    await this.db.await_proc('mfs_rename', copied.nid, base);
+
+    const outfile = resolve(copied.home_dir, copied.nid, `orig.${copied.ext}`);
+    const res = await Network.request({ method: 'GET', outfile, url: srcUrl });
+    copied = await this.db.await_proc('mfs_access_node', this.uid, copied.nid);
+    if (isString(copied.metadata)) copied.metadata = JSON.parse(copied.metadata);
+    copied.metadata = copied.metadata || {};
+    delete copied.metadata._seen_;
+    copied.publish_time = Math.floor(res.mtimeMs / 1000);
+    copied.metadata.md5Hash = res.md5Hash;
+    copied.md5Hash = res.md5Hash;
+    copied.filesize = res.size;
+    copied.mtime = copied.publish_time;
+    await this.db.await_proc('mfs_set_node_attr', copied.id, copied, 0);
+    await this.db.await_proc('mfs_set_metadata', copied.id, { md5Hash: res.md5Hash }, 0);
+    Document.rebuildInfo(copied, this.uid, this.input.get(Attr.socket_id));
+    await this.sendNodeAttributes(copied, 'media.new');
+    this.output.data(copied);
+  }
+
+  /**
+   * Mirror a rename into the LIVE editing session (Command Service `meta`), so
+   * every open editor retitles without a reopen. The storage rename itself is
+   * media.rename — this endpoint only tells the document server about it.
+   */
+  async retitle() {
+    const granted = this.granted_node();
+    const key = String(this.input.need('key'));
+    const title = String(this.input.need('title') || '').trim();
+    // The key must denote the very node this session was granted on — no
+    // cross-document meta pushes.
+    const [kHub, kNid] = key.split('.');
+    if (kHub !== granted.hub_id || kNid !== granted.nid) {
+      return this.exception.unauthorized('Permission denied');
+    }
+    if (!title) return this.exception.user('INVALID_FILENAME');
+    let reply = null;
+    try {
+      reply = await sendDsCommand(
+        Cache.getSysConf('eurofficeServerUrl'),
+        { c: 'meta', key, meta: { title } },
+        eo_secret
+      );
+    } catch (e) {
+      // Harmless degradation: the file IS renamed; open editors just keep the
+      // old title until they reopen.
+      this.warn('[euroffice.retitle] command service unreachable:', e && e.message);
+    }
+    this.output.data({ error: reply ? reply.error : -1 });
   }
 
 }
