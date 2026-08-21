@@ -150,14 +150,17 @@ check('no session or query language can change it', () => {
 });
 
 console.log('\nFile-menu integrations (Save Copy as…, Rename)');
+// Relative on purpose — resolved against the page URL so the fetch stays on
+// the SAME origin as the served page (hub subdomains included) and carries the
+// session cookie. An absolute main-domain URL arrives anonymous and is denied.
 const INTEGRATION = {
   nid: 'node1',
   hub_id: 'hub1',
   ext: 'docx',
   docKey: 'hub1.node1.1700000000',
-  saveAsUrl: 'https://host/-/svc/euroffice.save_as',
-  renameUrl: 'https://host/-/svc/media.rename',
-  retitleUrl: 'https://host/-/svc/euroffice.retitle',
+  saveAsUrl: 'euroffice.save_as',
+  renameUrl: 'media.rename',
+  retitleUrl: 'euroffice.retitle',
 };
 check('an edit session page wires both editor events', () => {
   const html = renderEditorPage(buildConfig(), INTEGRATION);
