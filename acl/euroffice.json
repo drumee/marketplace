@@ -114,6 +114,69 @@
       "permission": {
         "src": "write"
       }
+    },
+    "save_as": {
+      "doc": "Editor 'Save Copy as…': create a sibling copy of the document, its content pulled from the document server's download URL.",
+      "scope": "hub",
+      "permission": {
+        "src": "write"
+      },
+      "params": {
+        "nid": {
+          "type": "string",
+          "required": true,
+          "doc": "Source document node id."
+        },
+        "hub_id": {
+          "type": "string",
+          "required": true,
+          "doc": "Hub id."
+        },
+        "url": {
+          "type": "string",
+          "required": true,
+          "doc": "Download URL of the copy on the document server (must be the eurofficeServerUrl origin)."
+        },
+        "title": {
+          "type": "string",
+          "required": true,
+          "doc": "Name for the copy."
+        },
+        "file_type": {
+          "type": "string",
+          "required": false,
+          "doc": "Format of the copy; v1 must match the source extension."
+        }
+      }
+    },
+    "retitle": {
+      "doc": "Mirror a rename into the live document-server session (Command Service meta) so every open editor retitles.",
+      "scope": "hub",
+      "permission": {
+        "src": "write"
+      },
+      "params": {
+        "nid": {
+          "type": "string",
+          "required": true,
+          "doc": "Document node id."
+        },
+        "hub_id": {
+          "type": "string",
+          "required": true,
+          "doc": "Hub id."
+        },
+        "key": {
+          "type": "string",
+          "required": true,
+          "doc": "Editor session key (hub.nid.mtime)."
+        },
+        "title": {
+          "type": "string",
+          "required": true,
+          "doc": "New display title, extension included."
+        }
+      }
     }
   },
   "modules": {

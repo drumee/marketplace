@@ -31,7 +31,7 @@ function toScriptJson(config) {
  * @param {*} config the config object that was signed into `config.token`
  * @returns {string} a complete HTML document
  */
-function renderEditorPage(config) {
+function renderEditorPage(config, integration = null) {
   const html = String(readFileSync(TEMPLATE)).trim();
   // The document server writes its iframe over this element, so the id only has
   // to be unique and valid. Derive it from the user id as before, but keep it to
@@ -42,6 +42,10 @@ function renderEditorPage(config) {
     ...config,
     placeholderId,
     configJson: toScriptJson(config),
+    // Menu integrations (Save Copy as…, Rename). Event handlers are functions,
+    // so they can never be part of the signed config — the template attaches
+    // them around it when this block is present.
+    integrationJson: integration ? toScriptJson(integration) : null,
   });
 }
 
