@@ -127,7 +127,7 @@ class OnlyOffice extends Mfs {
       return new URL(decoded.payload.url).searchParams
 
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message);
       this.exception.unauthorized("Invalid authorization token")
       return {};
     }
@@ -179,7 +179,7 @@ class OnlyOffice extends Mfs {
         await this.send_media(node, ORIGINAL);
       }
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message);
       this.exception.unauthorized("Invalid authorization token")
     }
 
@@ -288,7 +288,7 @@ class OnlyOffice extends Mfs {
     try {
       data = Jwt.verify(this.input.get(Attr.token), oo_secret);
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, oo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message);
       this.exception.unauthorized("Invalid authorization token")
       return
     }
