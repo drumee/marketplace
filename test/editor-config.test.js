@@ -9,7 +9,7 @@
 const assert = require('assert');
 const { documentTypeOf } = require('../service/lib/doc-type');
 const { renderEditorPage } = require('../service/lib/editor-page');
-const { buildEditorConfig, normalizeLang } = require('../service/lib/editor-config');
+const { buildEditorConfig, EDITOR_LANG } = require('../service/lib/editor-config');
 
 let checks = 0;
 function check(what, fn) { fn(); checks++; console.log('  ok  ' + what); }
@@ -139,17 +139,14 @@ check('the <title> element is HTML-escaped', () => {
   assert.ok(/<title>&lt;b&gt;x&lt;\/b&gt;\.docx<\/title>/.test(html));
 });
 
-console.log('\nthe editor UI language is pinned to something the server ships');
-check('a supported language passes through', () => {
-  assert.strictEqual(normalizeLang('fr'), 'fr');
+console.log('\nthe editor UI language is always English, by decision');
+check('the pinned language is English', () => {
+  assert.strictEqual(EDITOR_LANG, 'en');
 });
-check('a regional tag is reduced to its base language', () => {
-  assert.strictEqual(normalizeLang('FR-CA'), 'fr');
-});
-check('an unsupported language falls back to English, never to the server default', () => {
-  assert.strictEqual(normalizeLang('de'), 'en');
-  assert.strictEqual(normalizeLang(''), 'en');
-  assert.strictEqual(normalizeLang(undefined), 'en');
+check('no session or query language can change it', () => {
+  assert.strictEqual(buildConfig({ lang: 'fr' }).editorConfig.lang, 'en');
+  assert.strictEqual(buildConfig({ lang: 'FR-CA' }).editorConfig.lang, 'en');
+  assert.strictEqual(buildConfig({ lang: undefined }).editorConfig.lang, 'en');
 });
 
 console.log('\nboth services are configured by the same builder');

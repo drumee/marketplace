@@ -62,15 +62,9 @@ class OnlyOffice extends Mfs {
     // Map the app theme forwarded by the frontend onto the OnlyOffice uiTheme.
     const uiTheme = this.input.use('theme', 'light') === 'dark' ? 'theme-dark' : 'theme-light';
 
-    // Editor UI language, same as the euroffice path. The desk forwards &lang=
-    // on the iframe URL for whichever service `doc_editor` names; this service
-    // used to ignore it, so the editor chrome fell back to the document
-    // server's own default language.
-    const uiLang = this.input.use('lang', '')
-      || ((this.user && this.user.get(Attr.profile)) || {}).lang;
-
     // Return the configuration. Shared with the euroffice service so both
-    // editors are configured identically — see lib/editor-config.
+    // editors are configured identically — see lib/editor-config, which also
+    // pins the editor UI language (always English, by decision).
     const confObject = buildEditorConfig({
       extension,
       filename,
@@ -79,7 +73,6 @@ class OnlyOffice extends Mfs {
       uid,
       fullname,
       uiTheme,
-      lang: uiLang,
       readUrl: `${this.input.homepath()}svc/onlyoffice.read?${query}`,
       callbackUrl: `${this.input.homepath()}svc/onlyoffice.callback?key=${sessionKey}`,
       nid,

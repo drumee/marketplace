@@ -186,16 +186,9 @@ class EurOffice extends Mfs {
     // Map the app theme forwarded by the frontend onto the OnlyOffice uiTheme.
     const uiTheme = this.input.use('theme', 'light') === 'dark' ? 'theme-dark' : 'theme-light';
 
-    // Editor UI language. OnlyOffice takes it from editorConfig.lang; with
-    // nothing passed it falls back to its OWN default, which is how the sheet
-    // tabs and menus came up in French inside an English Drumee session. The
-    // frontend forwards &lang= on the iframe URL (ui-team player/document
-    // edit()); fall back to the account profile, then English.
-    const uiLang = this.input.use('lang', '')
-      || ((this.user && this.user.get(Attr.profile)) || {}).lang;
-
     // Return the configuration. Shared with the onlyoffice service so both
-    // editors are configured identically — see lib/editor-config.
+    // editors are configured identically — see lib/editor-config, which also
+    // pins the editor UI language (always English, by decision).
     const confObject = buildEditorConfig({
       extension,
       filename,
@@ -204,7 +197,6 @@ class EurOffice extends Mfs {
       uid,
       fullname,
       uiTheme,
-      lang: uiLang,
       readUrl: `${this.input.homepath()}svc/euroffice.read?${query}`,
       callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}${_cdt ? `&cdt=${encodeURIComponent(_cdt)}` : ''}`,
       nid,
