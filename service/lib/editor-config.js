@@ -1,23 +1,12 @@
 const { documentTypeOf } = require('./doc-type');
 
 /**
- * Editor UI languages the document server is deployed with. Anything else falls
- * back to English rather than letting the document server pick its own default,
- * which is how an English Drumee session ended up with French sheet tabs.
+ * The editor UI is ALWAYS English — product decision (2026-08-22). Left to its
+ * own devices the document server picks its own default (the French-toolbar
+ * incident); pinning the value here means no session language, profile
+ * setting, or query parameter can change it.
  */
-const SUPPORTED_LANGS = ['en', 'fr', 'es', 'km', 'ru', 'zh'];
-
-/**
- * @param {*} requested the `lang` query parameter forwarded by the desk
- * @param {*} fallback the account profile language
- * @returns {string} a language the document server understands
- */
-function normalizeLang(requested, fallback) {
-  const lang = String(requested || fallback || 'en')
-    .toLowerCase()
-    .split(/[-_.]/)[0];
-  return SUPPORTED_LANGS.includes(lang) ? lang : 'en';
-}
+const EDITOR_LANG = 'en';
 
 /**
  * Build the document-server config, ready to be signed.
@@ -35,7 +24,7 @@ function normalizeLang(requested, fallback) {
 function buildEditorConfig(opt) {
   const {
     extension, filename, sessionKey, mode, uid, fullname,
-    uiTheme, lang, readUrl, callbackUrl, nid, hub_id, documentServerUrl,
+    uiTheme, readUrl, callbackUrl, nid, hub_id, documentServerUrl,
   } = opt;
 
   // Selects which editor the document server loads, and with it the chrome the
@@ -74,7 +63,7 @@ function buildEditorConfig(opt) {
     height: '100%',
     editorConfig: {
       mode,
-      lang: normalizeLang(lang),
+      lang: EDITOR_LANG,
       callbackUrl,
       user: {
         id: uid,
@@ -109,4 +98,4 @@ function buildEditorConfig(opt) {
   };
 }
 
-module.exports = { buildEditorConfig, normalizeLang, SUPPORTED_LANGS };
+module.exports = { buildEditorConfig, EDITOR_LANG };
