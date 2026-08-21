@@ -2,7 +2,7 @@ const { resolve, join } = require('path');
 const {
   RedisStore, sysEnv, Attr, Permission, Constants, Network, toArray, Cache
 } = require('@drumee/server-essentials');
-const { template, isString } = require('lodash');
+const { isString } = require('lodash');
 const Jwt = require('jsonwebtoken'); // Make sure this is installed
 const {
   Document,
@@ -14,14 +14,13 @@ const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync } = require('jsonfile');
 const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
+const { buildEditorConfig } = require("./lib/editor-config");
+const { renderEditorPage } = require("./lib/editor-page");
 const { EurOffice: eo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
 } = Constants;
 
-const {
-  readFileSync: readFile,
-} = require("fs");
 
 class EurOffice extends Mfs {
 
@@ -30,12 +29,15 @@ class EurOffice extends Mfs {
  */
   async sendHtml(data) {
     const { main_domain } = sysEnv()
-    const tpl = resolve(__dirname, 'templates/euroffice.html');
-    let html = readFile(tpl);
-    html = String(html).trim().toString();
-    const content = template(html)(data);
+    const content = renderEditorPage(data);
 
-    this.output.set_header("Access-Control-Allow-Origin", `*.${main_domain}`);
+    // "*.domain" is not a valid Allow-Origin value; echo the caller's origin
+    // when it belongs to this deployment (hub subdomains included).
+    const origin = this.input.headers()['origin'] || '';
+    if (origin === `https://${main_domain}` || origin.endsWith(`.${main_domain}`)) {
+      this.output.set_header("Access-Control-Allow-Origin", origin);
+      this.output.set_header("Vary", "Origin");
+    }
     this.output.set_header("Pragma", "no-cache");
     this.output.html(content);
   }
@@ -189,42 +191,26 @@ class EurOffice extends Mfs {
     // tabs and menus came up in French inside an English Drumee session. The
     // frontend forwards &lang= on the iframe URL (ui-team player/document
     // edit()); fall back to the account profile, then English.
-    let uiLang = this.input.use('lang', '')
-      || ((this.user && this.user.get(Attr.profile)) || {}).lang
-      || 'en';
-    uiLang = String(uiLang).toLowerCase().split(/[-_.]/)[0];
-    if (!['en', 'fr', 'es', 'km', 'ru', 'zh'].includes(uiLang)) uiLang = 'en';
+    const uiLang = this.input.use('lang', '')
+      || ((this.user && this.user.get(Attr.profile)) || {}).lang;
 
-    // Return the configuration
-    const confObject = {
-      document: {
-        fileType: extension,
-        key: sessionKey,
-        title: filename,
-        url: `${this.input.homepath()}svc/euroffice.read?${query}`
-      },
-      editorConfig: {
-        mode,
-        lang: uiLang,
-        callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}${_cdt ? `&cdt=${encodeURIComponent(_cdt)}` : ''}`,
-        user: {
-          id: uid,
-          name: fullname
-        },
-        customization: {
-          uiTheme
-        }
-      },
-      customization: {
-        forcesave: true,  // Enable Save button and intermediate versions
-      },
-      // Your custom Drumee data
-      drumeeContext: {
-        nid,
-        hub_id
-      },
-      documentServerUrl: Cache.getSysConf('eurofficeServerUrl')
-    };
+    // Return the configuration. Shared with the onlyoffice service so both
+    // editors are configured identically — see lib/editor-config.
+    const confObject = buildEditorConfig({
+      extension,
+      filename,
+      sessionKey,
+      mode,
+      uid,
+      fullname,
+      uiTheme,
+      lang: uiLang,
+      readUrl: `${this.input.homepath()}svc/euroffice.read?${query}`,
+      callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}${_cdt ? `&cdt=${encodeURIComponent(_cdt)}` : ''}`,
+      nid,
+      hub_id,
+      documentServerUrl: Cache.getSysConf('eurofficeServerUrl'),
+    });
 
     // Sign the ENTIRE config as the token
     const token = Jwt.sign(
@@ -327,7 +313,7 @@ class EurOffice extends Mfs {
       return new URL(decoded.payload.url).searchParams
 
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message);
       this.exception.unauthorized("Invalid authorization token")
       return {};
     }
@@ -379,7 +365,7 @@ class EurOffice extends Mfs {
         await this.send_media(node, ORIGINAL);
       }
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message);
       this.exception.unauthorized("Invalid authorization token")
     }
 
@@ -469,7 +455,9 @@ class EurOffice extends Mfs {
   async handleClosure(data, overrideUid) {
     const { actions, notmodified, history, key, url } = data;
     if (notmodified) return;
-    for (let action of actions) {
+    // A status-2/6 callback is not guaranteed to carry an actions array;
+    // without the guard the save is lost to a TypeError.
+    for (let action of actions || []) {
       switch (action.type) {
         case 0:
           // For a secure-share save, write as the share CREATOR (file owner) —
@@ -497,7 +485,7 @@ class EurOffice extends Mfs {
     try {
       data = Jwt.verify(this.input.get(Attr.token), eo_secret);
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message);
       this.exception.unauthorized("Invalid authorization token")
       return
     }
