@@ -217,6 +217,13 @@ class EurOffice extends Mfs {
     // File-menu integrations (Save Copy as…, Rename) — desk edit sessions only:
     // a share session is creator-bound and routes writes through signed grants,
     // which neither integration carries yet.
+    //
+    // The service URLs are RELATIVE on purpose. The editor page may be served
+    // from a hub subdomain (team-x.<domain>/-/<ep>/svc/euroffice.html) while
+    // homepath() names the main domain — an absolute URL would make the
+    // handlers' fetch cross-origin, the session cookie would stay behind, and
+    // the call would arrive anonymous and be denied. Relative to the page,
+    // "euroffice.save_as" always lands on the same origin and endpoint.
     let integration = null;
     if (mode === 'edit' && !_shareToken) {
       integration = {
@@ -224,9 +231,9 @@ class EurOffice extends Mfs {
         hub_id,
         ext: extension,
         docKey: sessionKey,
-        saveAsUrl: `${this.input.homepath()}svc/euroffice.save_as`,
-        renameUrl: `${this.input.homepath()}svc/media.rename`,
-        retitleUrl: `${this.input.homepath()}svc/euroffice.retitle`,
+        saveAsUrl: 'euroffice.save_as',
+        renameUrl: 'media.rename',
+        retitleUrl: 'euroffice.retitle',
       };
     }
     this.sendHtml(confObject, integration)
