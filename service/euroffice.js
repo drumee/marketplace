@@ -18,6 +18,7 @@ const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
 const { buildEditorConfig } = require("./lib/editor-config");
 const { renderEditorPage } = require("./lib/editor-page");
 const { sendDsCommand } = require("./lib/ds-command");
+const { convertDocument } = require("./lib/ds-convert");
 const { EurOffice: eo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
@@ -107,7 +108,8 @@ class EurOffice extends Mfs {
       }
     }
     if (!_node) return this.exception.unauthorized('Permission denied');
-    const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = _node;
+    const { hub_id, nid, privilege, md5Hash } = _node;
+    let { filename, extension, mtime } = _node;
     // Mode: for a share request the resolved node is the creator's (full priv), so
     // derive the mode from the token caps; otherwise from the node privilege.
     let mode = privilege & PERMISSION_WRITE ? 'edit' : 'view';
@@ -150,6 +152,57 @@ class EurOffice extends Mfs {
     const _editAllowed = !!(_caps && _caps.canEdit && ((_signedIn && _distinctFromCreator) || _verifiedOwner));
     if (_shareToken) {
       mode = _editAllowed ? 'edit' : 'view';
+    }
+
+    // Legacy binary formats (.xls/.doc/.ppt) cannot be co-edited: the editor
+    // converts them to OOXML in its cache, sees the config still declares the
+    // legacy type, and loops "version changed / reload" forever. Upgrade to the
+    // modern equivalent on open (as Word/Google do) and open the native file.
+    // Desk edit sessions only; ANY failure falls back to opening as-is, and a
+    // modern format never enters this block.
+    const LEGACY_UPGRADE = { xls: 'xlsx', doc: 'docx', ppt: 'pptx', xlt: 'xltx', dot: 'dotx', pot: 'potx' };
+    const _legacyExt = String(extension || '').toLowerCase();
+    if (mode === 'edit' && !_shareToken && LEGACY_UPGRADE[_legacyExt]) {
+      try {
+        const _modernExt = LEGACY_UPGRADE[_legacyExt];
+        const _cvKey = `${hub_id}.${nid}.${mtime}`;
+        const _cvSig = this.signString(`${_cvKey}/${this.uid}`);
+        const _srcUrl = `${this.input.homepath()}svc/euroffice.read?signature=${_cvSig}&sessionKey=${_cvKey}&uid=${this.uid}`;
+        const _fileUrl = await convertDocument(
+          Cache.getSysConf('eurofficeServerUrl'),
+          { filetype: _legacyExt, outputtype: _modernExt, key: `cv.${_cvKey}`, title: `${filename}.${_legacyExt}`, url: _srcUrl },
+          eo_secret
+        );
+        if (_fileUrl) {
+          const _dbName = _node.db_name || _node.actual_db;
+          const _base = resolve(_node.home_dir, nid);
+          const _res = await Network.request({ method: 'GET', outfile: resolve(_base, `orig.${_modernExt}`), url: _fileUrl });
+          try { unlinkSync(resolve(_base, `orig.${_legacyExt}`)); } catch (e) { /* already gone */ }
+          _node.extension = _modernExt;
+          _node.ext = _modernExt;
+          if (isString(_node.mimetype) && _node.mimetype.includes('/')) {
+            _node.mimetype = `${_node.mimetype.split('/')[0]}/${_modernExt}`;
+          }
+          if (isString(_node.metadata)) { try { _node.metadata = JSON.parse(_node.metadata); } catch (e) { _node.metadata = {}; } }
+          _node.metadata = _node.metadata || {};
+          delete _node.metadata._seen_;
+          _node.metadata.md5Hash = _res.md5Hash;
+          _node.md5Hash = _res.md5Hash;
+          _node.filesize = _res.size;
+          _node.publish_time = Math.floor(_res.mtimeMs / 1000);
+          _node.mtime = _node.publish_time;
+          await this.yp.await_proc(`${_dbName}.mfs_set_node_attr`, _node.id, _node, 0);
+          await this.yp.await_proc(`${_dbName}.mfs_set_metadata`, _node.id, { md5Hash: _res.md5Hash }, 0);
+          // The editor now opens the native file: refresh the locals the config uses.
+          extension = _modernExt;
+          mtime = _node.mtime;
+          this.debug(`[euroffice.html] upgraded ${_legacyExt} -> ${_modernExt} for ${nid}`);
+        } else {
+          this.warn(`[euroffice.html] conversion of ${_legacyExt} returned no file; opening as-is`);
+        }
+      } catch (e) {
+        this.warn('[euroffice.html] legacy conversion failed, opening as-is:', e && e.message);
+      }
     }
     // The content fetch (euroffice.read) and save must run as the file OWNER. For a
     // share request the recipient session isn't authorized on the node, so sign the
