@@ -13,7 +13,7 @@ const { move_node, copy_node } = MfsTools;
 const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync } = require('jsonfile');
-const { unlinkSync } = require('fs');
+const { unlinkSync, renameSync, openSync, readSync, closeSync } = require('fs');
 const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
 const { buildEditorConfig } = require("./lib/editor-config");
 const { renderEditorPage } = require("./lib/editor-page");
@@ -165,6 +165,32 @@ class EurOffice extends Mfs {
     if (mode === 'edit' && !_shareToken && LEGACY_UPGRADE[_legacyExt]) {
       try {
         const _modernExt = LEGACY_UPGRADE[_legacyExt];
+        const _base0 = resolve(_node.home_dir, nid);
+        // A file labelled .xls/.doc/.ppt whose bytes are actually a ZIP (PK\x03\x04)
+        // is already OOXML, only mislabelled — a leftover from the earlier
+        // wrote-xlsx-into-orig.xls bug. Relabel it in place (no conversion), which
+        // also self-heals any such file a tester still has.
+        let _mislabelled = false;
+        try {
+          const _mb = Buffer.alloc(4);
+          const _fd = openSync(resolve(_base0, `orig.${_legacyExt}`), 'r');
+          try { readSync(_fd, _mb, 0, 4, 0); } finally { closeSync(_fd); }
+          _mislabelled = _mb.toString('hex') === '504b0304';
+        } catch (e) { /* fall through to conversion */ }
+        if (_mislabelled) {
+          const _dbName = _node.db_name || _node.actual_db;
+          try { renameSync(resolve(_base0, `orig.${_legacyExt}`), resolve(_base0, `orig.${_modernExt}`)); } catch (e) { /* keep going */ }
+          _node.extension = _modernExt;
+          _node.ext = _modernExt;
+          if (isString(_node.mimetype) && _node.mimetype.includes('/')) {
+            _node.mimetype = `${_node.mimetype.split('/')[0]}/${_modernExt}`;
+          }
+          await this.yp.await_proc(`${_dbName}.mfs_set_node_attr`, _node.id, _node, 0);
+          extension = _modernExt;
+          this.debug(`[euroffice.html] relabelled mislabelled ${_legacyExt} -> ${_modernExt} for ${nid}`);
+          // Skip the document-server conversion below.
+          throw { __handled__: true };
+        }
         const _cvKey = `${hub_id}.${nid}.${mtime}`;
         const _cvSig = this.signString(`${_cvKey}/${this.uid}`);
         const _srcUrl = `${this.input.homepath()}svc/euroffice.read?signature=${_cvSig}&sessionKey=${_cvKey}&uid=${this.uid}`;
@@ -201,7 +227,9 @@ class EurOffice extends Mfs {
           this.warn(`[euroffice.html] conversion of ${_legacyExt} returned no file; opening as-is`);
         }
       } catch (e) {
-        this.warn('[euroffice.html] legacy conversion failed, opening as-is:', e && e.message);
+        if (!(e && e.__handled__)) {
+          this.warn('[euroffice.html] legacy conversion failed, opening as-is:', e && e.message);
+        }
       }
     }
     // The content fetch (euroffice.read) and save must run as the file OWNER. For a
