@@ -13,6 +13,7 @@ const { move_node, copy_node } = MfsTools;
 const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync } = require('jsonfile');
+const { unlinkSync } = require('fs');
 const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
 const { buildEditorConfig } = require("./lib/editor-config");
 const { renderEditorPage } = require("./lib/editor-page");
@@ -407,7 +408,7 @@ class EurOffice extends Mfs {
   * @param {*} dir
   * @param {*} filter
   */
-  async importFile(url, sessionKey, uid) {
+  async importFile(url, sessionKey, uid, savedType) {
     // NULL-GUARD before destructuring: getNode returns null when the uid lacks write
     // on the node (e.g. a recipient's own uid) → destructuring null would crash the
     // callback (was the euroffice.callback TypeError). The share save passes the
@@ -416,8 +417,23 @@ class EurOffice extends Mfs {
     if (!_res || !_res.node) return
     const { node, db_name } = _res
 
+    // The format the document server actually produced. A legacy file (.xls/.doc/
+    // .ppt) is opened by converting it to its modern equivalent, and the editor
+    // only EVER saves the modern format back — so writing those bytes into the
+    // legacy-named orig.xls left the content and the extension disagreeing, and
+    // the next open came up read-only ("format does not match"). Follow the saved
+    // format instead: promote the node to it, exactly as MS/Google upgrade a
+    // legacy file on first save.
+    const _srcExt = String(node.ext || '').toLowerCase();
+    let _outExt = String(savedType || '').toLowerCase();
+    if (!_outExt) {
+      try { _outExt = new URL(url).pathname.split('.').pop().toLowerCase(); } catch (e) { /* keep source */ }
+    }
+    if (!/^[a-z0-9]{1,8}$/.test(_outExt)) _outExt = _srcExt;
+    const _promoted = _outExt && _outExt !== _srcExt;
+
     const base = resolve(node.home_dir, node.nid)
-    const outfile = resolve(base, `orig.${node.ext}`)
+    const outfile = resolve(base, `orig.${_outExt || node.ext}`)
     this.debug(`Downloading ${this.input.get(Attr.url)} => ${outfile}.`);
     let opt = {
       method: 'GET',
@@ -434,6 +450,15 @@ class EurOffice extends Mfs {
       // node.metadata = cleanSeen(node.metadata)
     } else {
       node.metadata = {}
+    }
+    if (_promoted) {
+      // Drop the stale legacy file and move the node onto the modern extension.
+      try { unlinkSync(resolve(base, `orig.${_srcExt}`)); } catch (e) { /* already gone */ }
+      node.extension = _outExt;
+      node.ext = _outExt;
+      if (isString(node.mimetype) && node.mimetype.includes('/')) {
+        node.mimetype = `${node.mimetype.split('/')[0]}/${_outExt}`;
+      }
     }
     node.publish_time = Math.floor(res.mtimeMs / 1000);
     node.metadata.md5Hash = md5Hash;
@@ -468,7 +493,7 @@ class EurOffice extends Mfs {
    * 
    */
   async handleClosure(data, overrideUid) {
-    const { actions, notmodified, history, key, url } = data;
+    const { actions, notmodified, history, key, url, filetype } = data;
     if (notmodified) return;
     // A status-2/6 callback is not guaranteed to carry an actions array;
     // without the guard the save is lost to a TypeError.
@@ -479,7 +504,7 @@ class EurOffice extends Mfs {
           // the recipient's own uid has no ACL on the creator's node. overrideUid
           // is set by callback() only after the share-token can_edit + node-scope
           // checks pass; a normal desk save passes no overrideUid (action.userid).
-          if (url) await this.importFile(url, key, overrideUid || action.userid);
+          if (url) await this.importFile(url, key, overrideUid || action.userid, filetype);
           break;
         case 1:
           this.debug("New user joining")
@@ -650,6 +675,7 @@ class EurOffice extends Mfs {
     const title = String(this.input.need('title') || '').trim();
     const ext = String(node.ext || '').toLowerCase();
     const fileType = String(this.input.use('file_type', ext) || ext).toLowerCase();
+    if (!/^[a-z0-9]{1,8}$/.test(fileType)) return this.exception.user('UNSUPPORTED_FORMAT');
 
     // The only host this service will ever fetch is the document server itself.
     let parsed = null;
@@ -659,7 +685,6 @@ class EurOffice extends Mfs {
       this.warn('[euroffice.save_as] refused a url outside the document server');
       return this.exception.unauthorized('Permission denied');
     }
-    if (fileType !== ext) return this.exception.user('UNSUPPORTED_FORMAT');
     if (!title || /[\/\\]/.test(title) || /^\.+$/.test(title)) {
       return this.exception.user('INVALID_FILENAME');
     }
@@ -684,20 +709,36 @@ class EurOffice extends Mfs {
     if (!copied || !copied.nid) return this.exception.user('COPY_FAILED');
 
     // Name the copy as asked (the proc de-duplicates), then overwrite its
-    // content with the state the editor handed us — the importFile steps.
+    // content with the state the editor handed us — the importFile steps. The
+    // copy takes the CHOSEN output format (Save Copy as… may pick xlsx/ods/pdf/…
+    // from a legacy .xls), so its stored file and extension follow file_type,
+    // never the source's.
     let base = title;
-    const suffix = `.${ext}`;
-    if (base.toLowerCase().endsWith(suffix)) {
-      base = base.slice(0, -suffix.length).trim() || title;
+    for (const suffix of [`.${fileType}`, `.${ext}`]) {
+      if (base.toLowerCase().endsWith(suffix)) {
+        base = base.slice(0, -suffix.length).trim() || title;
+        break;
+      }
     }
     await this.db.await_proc('mfs_rename', copied.nid, base);
+    copied = await this.db.await_proc('mfs_access_node', this.uid, copied.nid);
 
-    const outfile = resolve(copied.home_dir, copied.nid, `orig.${copied.ext}`);
+    const outfile = resolve(copied.home_dir, copied.nid, `orig.${fileType}`);
     const res = await Network.request({ method: 'GET', outfile, url: srcUrl });
     copied = await this.db.await_proc('mfs_access_node', this.uid, copied.nid);
     if (isString(copied.metadata)) copied.metadata = JSON.parse(copied.metadata);
     copied.metadata = copied.metadata || {};
     delete copied.metadata._seen_;
+    if (fileType !== String(copied.ext || '').toLowerCase()) {
+      // mfs_copy_all cloned the SOURCE file (orig.<srcExt>); drop it and move
+      // the copy onto the chosen format.
+      try { unlinkSync(resolve(copied.home_dir, copied.nid, `orig.${copied.ext}`)); } catch (e) { /* none */ }
+      if (isString(copied.mimetype) && copied.mimetype.includes('/')) {
+        copied.mimetype = `${copied.mimetype.split('/')[0]}/${fileType}`;
+      }
+      copied.extension = fileType;
+      copied.ext = fileType;
+    }
     copied.publish_time = Math.floor(res.mtimeMs / 1000);
     copied.metadata.md5Hash = res.md5Hash;
     copied.md5Hash = res.md5Hash;
