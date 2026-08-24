@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title><%- document.title %></title>
+  <style>
+    /*
+      Served as a bare fragment before — no doctype, no <html>/<head>, no CSS —
+      which put the browser in quirks mode and left the UA defaults in force.
+
+      DocsAPI.DocEditor REPLACES the placeholder <div> with its own
+      <iframe width="100%" height="100%">, so it lands as a direct child of
+      <body>: inset 8px on every side by the body margin, and, being inline,
+      reserving ~4px of baseline descender beneath itself. The editor was laid
+      out ~20px taller and ~16px wider than the frame that had to hold it, with
+      the overflow falling outside the fold.
+
+      That lost strip is exactly the spreadsheet status bar (sheet tabs and the
+      "+" add-sheet button, drawn but off-screen), the right panel's collapse
+      rail (the only way to close it), and the horizontal scrollbar a page wider
+      than the window needs — which is why such a page read as cropped rather
+      than scrollable.
+
+      A definite height on the html/body chain, no margin, and a block-level
+      editor iframe give the document server the box we mean it to have.
+    */
+    html,
+    body {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+
+    /*
+      Both selectors on purpose. Depending on the document server build, api.js
+      either replaces the placeholder with its iframe (so the iframe is a child
+      of <body>) or appends the iframe inside it — this sizes the editor either
+      way, and `display: block` is what removes the inline baseline gap.
+    */
+    #<%= placeholderId %>,
+    iframe {
+      display: block;
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="<%= placeholderId %>"></div>
+  <!-- ?v= busts the year-long immutable cache on api.js: the document server's
+       asset version only changes on rebuild, so a hot-patched build never
+       reaches browsers that already cached it. Bump when the doc-server's
+       static assets are patched in place. -->
+  <script type="text/javascript" src="<%= documentServerUrl %>/web-apps/apps/api/documents/api.js?v=20260821"></script>
+  <script type="text/javascript">
+    // The config is emitted verbatim from the object the server signed, rather
+    // than re-listed field by field. The hand-copied version silently dropped
+    // whatever the list forgot — that is how `customization.forcesave` never
+    // reached the browser and left the Save button inert — and every field it
+    // did copy was a chance for the config and the JWT to disagree.
+    var config = <%= configJson %>;
+    <% if (integrationJson) { %>
+    // Drumee menu integrations — "Save Copy as…" and in-editor Rename. The
+    // editor only offers these File-menu items when a handler exists. Handlers
+    // are functions, so they live OUTSIDE the signed config (JSON.stringify
+    // drops them; the token stays valid) and call back into the same-origin
+    // Drumee services with this page's session cookies.
+    var drumee = <%= integrationJson %>;
+    var post = function (url, body) {
+      return fetch(url, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    };
+    config.events = {
+      // The document server hands us a download URL of the copy it assembled;
+      // the service pulls it and creates the file beside the original.
+      onRequestSaveAs: function (e) {
+        var d = (e && e.data) || {};
+        post(drumee.saveAsUrl, {
+          nid: drumee.nid,
+          hub_id: drumee.hub_id,
+          url: d.url,
+          title: d.title,
+          file_type: d.fileType
+        }).then(function (r) {
+          if (window.docEditor && docEditor.showMessage) {
+            docEditor.showMessage(r.ok
+              ? 'A copy was saved next to the original document'
+              : 'Could not save the copy');
+          }
+        }).catch(function (err) { console.error('saveAs failed', err); });
+      },
+      // Rename in storage through the platform service (name dedup, live
+      // updates), then mirror the title into the running editor session so
+      // every open tab retitles without a reopen.
+      onRequestRename: function (e) {
+        var title = String((e && e.data) || '').trim();
+        if (!title) return;
+        var ext = '.' + drumee.ext;
+        if (title.toLowerCase().slice(-ext.length) === ext.toLowerCase()) {
+          title = title.slice(0, -ext.length).trim();
+        }
+        if (!title) return;
+        post(drumee.renameUrl, { nid: drumee.nid, hub_id: drumee.hub_id, filename: title })
+          .then(function (r) {
+            if (!r.ok) throw new Error('rename HTTP ' + r.status);
+            return post(drumee.retitleUrl, {
+              nid: drumee.nid,
+              hub_id: drumee.hub_id,
+              key: drumee.docKey,
+              title: title + ext
+            });
+          })
+          .catch(function (err) { console.error('rename failed', err); });
+      }
+    };
+    <% } %>
+    var docEditor = new DocsAPI.DocEditor("<%= placeholderId %>", config);
+  </script>
+</body>
+
+</html>

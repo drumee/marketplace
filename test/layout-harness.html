@@ -1,0 +1,120 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>Editor host page — before / after</title>
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; color: #1c1c1c; background: #fafafa; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    p.lede { margin: 0 0 20px; max-width: 70ch; color: #555; }
+    .row { display: flex; gap: 24px; flex-wrap: wrap; }
+    figure { margin: 0; }
+    figcaption { font-weight: 600; margin-bottom: 6px; }
+    figcaption small { display: block; font-weight: 400; color: #666; }
+    /* Stands in for the player's <iframe>: a fixed box the editor must fit. */
+    .frame { width: 560px; height: 360px; border: 2px solid #c8102e; overflow: hidden; background: #fff; }
+    .frame.ok { border-color: #1a7f37; }
+    .frame iframe { width: 100%; height: 100%; border: 0; display: block; }
+    .readout { margin-top: 10px; font: 12px/1.6 ui-monospace, monospace; white-space: pre; }
+    .bad { color: #c8102e; }
+    .good { color: #1a7f37; }
+  </style>
+</head>
+
+<body>
+  <h1>Office editor host page: what the missing doctype and CSS actually cost</h1>
+  <p class="lede">
+    Each red/green box is a stand-in for the player's <code>&lt;iframe&gt;</code> — a fixed
+    560&times;360 area the editor has to fit inside. Inside each one, a stand-in editor is
+    injected the way <code>DocsAPI.DocEditor</code> injects the real one: an
+    <code>&lt;iframe width="100%" height="100%"&gt;</code> that <em>replaces</em> the placeholder
+    <code>&lt;div&gt;</code>. Only the host page around it differs. Watch the bottom-left
+    sheet tabs and the right-hand icon rail.
+  </p>
+
+  <div class="row">
+    <figure>
+      <figcaption>Before<small>bare fragment — no doctype, no CSS</small></figcaption>
+      <div class="frame"><iframe id="before"></iframe></div>
+      <div class="readout bad" id="r-before">measuring…</div>
+    </figure>
+    <figure>
+      <figcaption>After<small>full document, height chain, no margin, block iframe</small></figcaption>
+      <div class="frame ok"><iframe id="after"></iframe></div>
+      <div class="readout good" id="r-after">measuring…</div>
+    </figure>
+  </div>
+
+  <script>
+    // A stand-in for the OnlyOffice spreadsheet editor: the pieces that get
+    // clipped live hard against the edges, exactly as they do in the real one.
+    var EDITOR = [
+      '<!doctype html><html><head><meta charset="utf-8"><style>',
+      'html,body{height:100%;margin:0;font:12px system-ui,sans-serif;}',
+      '.app{height:100%;display:flex;flex-direction:column;background:#fff;}',
+      '.toolbar{height:34px;background:#f1f1f1;border-bottom:1px solid #ddd;display:flex;align-items:center;padding:0 8px;gap:8px;flex:none;}',
+      '.save{background:#2e6fd6;color:#fff;border-radius:3px;padding:3px 10px;}',
+      '.mid{flex:1;display:flex;min-height:0;}',
+      '.grid{flex:1;background:repeating-linear-gradient(to bottom,#fff 0 19px,#e9e9e9 19px 20px),repeating-linear-gradient(to right,#fff 0 79px,#e9e9e9 79px 80px);}',
+      '.rail{width:26px;background:#f1f1f1;border-left:1px solid #ddd;flex:none;display:flex;flex-direction:column;align-items:center;padding-top:6px;gap:6px;}',
+      '.rail i{width:16px;height:16px;background:#c8102e;border-radius:3px;display:block;}',
+      '.status{height:26px;background:#f1f1f1;border-top:1px solid #ddd;display:flex;align-items:center;gap:4px;padding:0 6px;flex:none;}',
+      '.tab{background:#fff;border:1px solid #ccc;border-bottom:0;padding:2px 10px;}',
+      '.plus{background:#c8102e;color:#fff;width:18px;height:18px;text-align:center;line-height:18px;border-radius:3px;}',
+      '</style></head><body><div class="app">',
+      '<div class="toolbar"><span class="save">Save</span><span>File</span><span>Home</span><span>Insert</span></div>',
+      '<div class="mid"><div class="grid"></div><div class="rail"><i title="close panel"></i><i></i><i></i></div></div>',
+      '<div class="status"><span class="plus">+</span><span class="tab">Sheet1</span><span class="tab">Sheet2</span></div>',
+      '</div></body></html>'
+    ].join('');
+
+    // The two host pages, differing only in the doctype and the stylesheet.
+    // The injection script is identical, and mirrors what api.js does.
+    var INJECT = [
+      '<div id="ph"></div>',
+      '<script>',
+      'var f=document.createElement("iframe");',
+      'f.width="100%";f.height="100%";f.frameBorder=0;',
+      'var ph=document.getElementById("ph");',
+      'ph.parentNode.replaceChild(f,ph);',
+      'var d=f.contentDocument;d.open();d.write(' + JSON.stringify(EDITOR) + ');d.close();',
+      'setTimeout(function(){',
+      '  var de=document.documentElement;',
+      '  parent.postMessage({id:ID,',
+      '    quirks:document.compatMode==="BackCompat",',
+      '    overflowY:de.scrollHeight-de.clientHeight,',
+      '    overflowX:de.scrollWidth-de.clientWidth},"*");',
+      '},120);',
+      '<\/script>'
+    ].join('\n');
+
+    var BEFORE = '<script>var ID="before";<\/script>' + INJECT;
+
+    var AFTER = [
+      '<!doctype html><html><head><meta charset="utf-8"><style>',
+      'html,body{height:100%;width:100%;margin:0;padding:0;overflow:hidden;}',
+      '#ph,iframe{display:block;width:100%;height:100%;border:0;}',
+      '</style></head><body>',
+      '<script>var ID="after";<\/script>',
+      INJECT,
+      '</body></html>'
+    ].join('\n');
+
+    document.getElementById('before').srcdoc = BEFORE;
+    document.getElementById('after').srcdoc = AFTER;
+
+    window.addEventListener('message', function (e) {
+      var d = e.data;
+      if (!d || !d.id) return;
+      var el = document.getElementById('r-' + d.id);
+      if (!el) return;
+      el.textContent =
+        'compatMode      : ' + (d.quirks ? 'BackCompat (quirks)' : 'CSS1Compat (standards)') + '\n' +
+        'clipped below   : ' + d.overflowY + 'px  <- the sheet-tab strip is 26px tall\n' +
+        'clipped at right: ' + d.overflowX + 'px  <- the panel collapse rail is 26px wide';
+    });
+  </script>
+</body>
+
+</html>

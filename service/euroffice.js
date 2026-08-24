@@ -2,7 +2,7 @@ const { resolve, join } = require('path');
 const {
   RedisStore, sysEnv, Attr, Permission, Constants, Network, toArray, Cache
 } = require('@drumee/server-essentials');
-const { template, isString } = require('lodash');
+const { isString } = require('lodash');
 const Jwt = require('jsonwebtoken'); // Make sure this is installed
 const {
   Document,
@@ -13,29 +13,34 @@ const { move_node, copy_node } = MfsTools;
 const { credential_dir } = sysEnv();
 const keyPath = resolve(credential_dir, 'crypto/secret.json');
 const { readFileSync } = require('jsonfile');
+const { unlinkSync, renameSync, openSync, readSync, closeSync } = require('fs');
 const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
+const { buildEditorConfig } = require("./lib/editor-config");
+const { renderEditorPage } = require("./lib/editor-page");
+const { sendDsCommand } = require("./lib/ds-command");
+const { convertDocument } = require("./lib/ds-convert");
 const { EurOffice: eo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
 } = Constants;
 
-const {
-  readFileSync: readFile,
-} = require("fs");
 
 class EurOffice extends Mfs {
 
   /**
  *
  */
-  async sendHtml(data) {
+  async sendHtml(data, integration = null) {
     const { main_domain } = sysEnv()
-    const tpl = resolve(__dirname, 'templates/euroffice.html');
-    let html = readFile(tpl);
-    html = String(html).trim().toString();
-    const content = template(html)(data);
+    const content = renderEditorPage(data, integration);
 
-    this.output.set_header("Access-Control-Allow-Origin", `*.${main_domain}`);
+    // "*.domain" is not a valid Allow-Origin value; echo the caller's origin
+    // when it belongs to this deployment (hub subdomains included).
+    const origin = this.input.headers()['origin'] || '';
+    if (origin === `https://${main_domain}` || origin.endsWith(`.${main_domain}`)) {
+      this.output.set_header("Access-Control-Allow-Origin", origin);
+      this.output.set_header("Vary", "Origin");
+    }
     this.output.set_header("Pragma", "no-cache");
     this.output.html(content);
   }
@@ -103,7 +108,8 @@ class EurOffice extends Mfs {
       }
     }
     if (!_node) return this.exception.unauthorized('Permission denied');
-    const { hub_id, nid, filename, extension, privilege, mtime, md5Hash } = _node;
+    const { hub_id, nid, privilege, md5Hash } = _node;
+    let { filename, extension, mtime } = _node;
     // Mode: for a share request the resolved node is the creator's (full priv), so
     // derive the mode from the token caps; otherwise from the node privilege.
     let mode = privilege & PERMISSION_WRITE ? 'edit' : 'view';
@@ -147,6 +153,85 @@ class EurOffice extends Mfs {
     if (_shareToken) {
       mode = _editAllowed ? 'edit' : 'view';
     }
+
+    // Legacy binary formats (.xls/.doc/.ppt) cannot be co-edited: the editor
+    // converts them to OOXML in its cache, sees the config still declares the
+    // legacy type, and loops "version changed / reload" forever. Upgrade to the
+    // modern equivalent on open (as Word/Google do) and open the native file.
+    // Desk edit sessions only; ANY failure falls back to opening as-is, and a
+    // modern format never enters this block.
+    const LEGACY_UPGRADE = { xls: 'xlsx', doc: 'docx', ppt: 'pptx', xlt: 'xltx', dot: 'dotx', pot: 'potx' };
+    const _legacyExt = String(extension || '').toLowerCase();
+    if (mode === 'edit' && !_shareToken && LEGACY_UPGRADE[_legacyExt]) {
+      try {
+        const _modernExt = LEGACY_UPGRADE[_legacyExt];
+        const _base0 = resolve(_node.home_dir, nid);
+        // A file labelled .xls/.doc/.ppt whose bytes are actually a ZIP (PK\x03\x04)
+        // is already OOXML, only mislabelled — a leftover from the earlier
+        // wrote-xlsx-into-orig.xls bug. Relabel it in place (no conversion), which
+        // also self-heals any such file a tester still has.
+        let _mislabelled = false;
+        try {
+          const _mb = Buffer.alloc(4);
+          const _fd = openSync(resolve(_base0, `orig.${_legacyExt}`), 'r');
+          try { readSync(_fd, _mb, 0, 4, 0); } finally { closeSync(_fd); }
+          _mislabelled = _mb.toString('hex') === '504b0304';
+        } catch (e) { /* fall through to conversion */ }
+        if (_mislabelled) {
+          const _dbName = _node.db_name || _node.actual_db;
+          try { renameSync(resolve(_base0, `orig.${_legacyExt}`), resolve(_base0, `orig.${_modernExt}`)); } catch (e) { /* keep going */ }
+          _node.extension = _modernExt;
+          _node.ext = _modernExt;
+          if (isString(_node.mimetype) && _node.mimetype.includes('/')) {
+            _node.mimetype = `${_node.mimetype.split('/')[0]}/${_modernExt}`;
+          }
+          await this.yp.await_proc(`${_dbName}.mfs_set_node_attr`, _node.id, _node, 0);
+          extension = _modernExt;
+          this.debug(`[euroffice.html] relabelled mislabelled ${_legacyExt} -> ${_modernExt} for ${nid}`);
+          // Skip the document-server conversion below.
+          throw { __handled__: true };
+        }
+        const _cvKey = `${hub_id}.${nid}.${mtime}`;
+        const _cvSig = this.signString(`${_cvKey}/${this.uid}`);
+        const _srcUrl = `${this.input.homepath()}svc/euroffice.read?signature=${_cvSig}&sessionKey=${_cvKey}&uid=${this.uid}`;
+        const _fileUrl = await convertDocument(
+          Cache.getSysConf('eurofficeServerUrl'),
+          { filetype: _legacyExt, outputtype: _modernExt, key: `cv.${_cvKey}`, title: `${filename}.${_legacyExt}`, url: _srcUrl },
+          eo_secret
+        );
+        if (_fileUrl) {
+          const _dbName = _node.db_name || _node.actual_db;
+          const _base = resolve(_node.home_dir, nid);
+          const _res = await Network.request({ method: 'GET', outfile: resolve(_base, `orig.${_modernExt}`), url: _fileUrl });
+          try { unlinkSync(resolve(_base, `orig.${_legacyExt}`)); } catch (e) { /* already gone */ }
+          _node.extension = _modernExt;
+          _node.ext = _modernExt;
+          if (isString(_node.mimetype) && _node.mimetype.includes('/')) {
+            _node.mimetype = `${_node.mimetype.split('/')[0]}/${_modernExt}`;
+          }
+          if (isString(_node.metadata)) { try { _node.metadata = JSON.parse(_node.metadata); } catch (e) { _node.metadata = {}; } }
+          _node.metadata = _node.metadata || {};
+          delete _node.metadata._seen_;
+          _node.metadata.md5Hash = _res.md5Hash;
+          _node.md5Hash = _res.md5Hash;
+          _node.filesize = _res.size;
+          _node.publish_time = Math.floor(_res.mtimeMs / 1000);
+          _node.mtime = _node.publish_time;
+          await this.yp.await_proc(`${_dbName}.mfs_set_node_attr`, _node.id, _node, 0);
+          await this.yp.await_proc(`${_dbName}.mfs_set_metadata`, _node.id, { md5Hash: _res.md5Hash }, 0);
+          // The editor now opens the native file: refresh the locals the config uses.
+          extension = _modernExt;
+          mtime = _node.mtime;
+          this.debug(`[euroffice.html] upgraded ${_legacyExt} -> ${_modernExt} for ${nid}`);
+        } else {
+          this.warn(`[euroffice.html] conversion of ${_legacyExt} returned no file; opening as-is`);
+        }
+      } catch (e) {
+        if (!(e && e.__handled__)) {
+          this.warn('[euroffice.html] legacy conversion failed, opening as-is:', e && e.message);
+        }
+      }
+    }
     // The content fetch (euroffice.read) and save must run as the file OWNER. For a
     // share request the recipient session isn't authorized on the node, so sign the
     // read URL with the CREATOR's uid; the editor's *displayed* user stays `uid`.
@@ -184,47 +269,23 @@ class EurOffice extends Mfs {
     // Map the app theme forwarded by the frontend onto the OnlyOffice uiTheme.
     const uiTheme = this.input.use('theme', 'light') === 'dark' ? 'theme-dark' : 'theme-light';
 
-    // Editor UI language. OnlyOffice takes it from editorConfig.lang; with
-    // nothing passed it falls back to its OWN default, which is how the sheet
-    // tabs and menus came up in French inside an English Drumee session. The
-    // frontend forwards &lang= on the iframe URL (ui-team player/document
-    // edit()); fall back to the account profile, then English.
-    let uiLang = this.input.use('lang', '')
-      || ((this.user && this.user.get(Attr.profile)) || {}).lang
-      || 'en';
-    uiLang = String(uiLang).toLowerCase().split(/[-_.]/)[0];
-    if (!['en', 'fr', 'es', 'km', 'ru', 'zh'].includes(uiLang)) uiLang = 'en';
-
-    // Return the configuration
-    const confObject = {
-      document: {
-        fileType: extension,
-        key: sessionKey,
-        title: filename,
-        url: `${this.input.homepath()}svc/euroffice.read?${query}`
-      },
-      editorConfig: {
-        mode,
-        lang: uiLang,
-        callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}${_cdt ? `&cdt=${encodeURIComponent(_cdt)}` : ''}`,
-        user: {
-          id: uid,
-          name: fullname
-        },
-        customization: {
-          uiTheme
-        }
-      },
-      customization: {
-        forcesave: true,  // Enable Save button and intermediate versions
-      },
-      // Your custom Drumee data
-      drumeeContext: {
-        nid,
-        hub_id
-      },
-      documentServerUrl: Cache.getSysConf('eurofficeServerUrl')
-    };
+    // Return the configuration. Shared with the onlyoffice service so both
+    // editors are configured identically — see lib/editor-config, which also
+    // pins the editor UI language (always English, by decision).
+    const confObject = buildEditorConfig({
+      extension,
+      filename,
+      sessionKey,
+      mode,
+      uid,
+      fullname,
+      uiTheme,
+      readUrl: `${this.input.homepath()}svc/euroffice.read?${query}`,
+      callbackUrl: `${this.input.homepath()}svc/euroffice.callback?key=${sessionKey}${_cdt ? `&cdt=${encodeURIComponent(_cdt)}` : ''}`,
+      nid,
+      hub_id,
+      documentServerUrl: Cache.getSysConf('eurofficeServerUrl'),
+    });
 
     // Sign the ENTIRE config as the token
     const token = Jwt.sign(
@@ -235,7 +296,29 @@ class EurOffice extends Mfs {
     // Add token to config sent to frontend
     confObject.token = token;
 
-    this.sendHtml(confObject)
+    // File-menu integrations (Save Copy as…, Rename) — desk edit sessions only:
+    // a share session is creator-bound and routes writes through signed grants,
+    // which neither integration carries yet.
+    //
+    // The service URLs are RELATIVE on purpose. The editor page may be served
+    // from a hub subdomain (team-x.<domain>/-/<ep>/svc/euroffice.html) while
+    // homepath() names the main domain — an absolute URL would make the
+    // handlers' fetch cross-origin, the session cookie would stay behind, and
+    // the call would arrive anonymous and be denied. Relative to the page,
+    // "euroffice.save_as" always lands on the same origin and endpoint.
+    let integration = null;
+    if (mode === 'edit' && !_shareToken) {
+      integration = {
+        nid,
+        hub_id,
+        ext: extension,
+        docKey: sessionKey,
+        saveAsUrl: 'euroffice.save_as',
+        renameUrl: 'media.rename',
+        retitleUrl: 'euroffice.retitle',
+      };
+    }
+    this.sendHtml(confObject, integration)
   }
 
   /**
@@ -327,7 +410,7 @@ class EurOffice extends Mfs {
       return new URL(decoded.payload.url).searchParams
 
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message);
       this.exception.unauthorized("Invalid authorization token")
       return {};
     }
@@ -379,7 +462,7 @@ class EurOffice extends Mfs {
         await this.send_media(node, ORIGINAL);
       }
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message);
       this.exception.unauthorized("Invalid authorization token")
     }
 
@@ -406,7 +489,7 @@ class EurOffice extends Mfs {
   * @param {*} dir
   * @param {*} filter
   */
-  async importFile(url, sessionKey, uid) {
+  async importFile(url, sessionKey, uid, savedType) {
     // NULL-GUARD before destructuring: getNode returns null when the uid lacks write
     // on the node (e.g. a recipient's own uid) → destructuring null would crash the
     // callback (was the euroffice.callback TypeError). The share save passes the
@@ -415,8 +498,23 @@ class EurOffice extends Mfs {
     if (!_res || !_res.node) return
     const { node, db_name } = _res
 
+    // The format the document server actually produced. A legacy file (.xls/.doc/
+    // .ppt) is opened by converting it to its modern equivalent, and the editor
+    // only EVER saves the modern format back — so writing those bytes into the
+    // legacy-named orig.xls left the content and the extension disagreeing, and
+    // the next open came up read-only ("format does not match"). Follow the saved
+    // format instead: promote the node to it, exactly as MS/Google upgrade a
+    // legacy file on first save.
+    const _srcExt = String(node.ext || '').toLowerCase();
+    let _outExt = String(savedType || '').toLowerCase();
+    if (!_outExt) {
+      try { _outExt = new URL(url).pathname.split('.').pop().toLowerCase(); } catch (e) { /* keep source */ }
+    }
+    if (!/^[a-z0-9]{1,8}$/.test(_outExt)) _outExt = _srcExt;
+    const _promoted = _outExt && _outExt !== _srcExt;
+
     const base = resolve(node.home_dir, node.nid)
-    const outfile = resolve(base, `orig.${node.ext}`)
+    const outfile = resolve(base, `orig.${_outExt || node.ext}`)
     this.debug(`Downloading ${this.input.get(Attr.url)} => ${outfile}.`);
     let opt = {
       method: 'GET',
@@ -433,6 +531,15 @@ class EurOffice extends Mfs {
       // node.metadata = cleanSeen(node.metadata)
     } else {
       node.metadata = {}
+    }
+    if (_promoted) {
+      // Drop the stale legacy file and move the node onto the modern extension.
+      try { unlinkSync(resolve(base, `orig.${_srcExt}`)); } catch (e) { /* already gone */ }
+      node.extension = _outExt;
+      node.ext = _outExt;
+      if (isString(node.mimetype) && node.mimetype.includes('/')) {
+        node.mimetype = `${node.mimetype.split('/')[0]}/${_outExt}`;
+      }
     }
     node.publish_time = Math.floor(res.mtimeMs / 1000);
     node.metadata.md5Hash = md5Hash;
@@ -467,16 +574,18 @@ class EurOffice extends Mfs {
    * 
    */
   async handleClosure(data, overrideUid) {
-    const { actions, notmodified, history, key, url } = data;
+    const { actions, notmodified, history, key, url, filetype } = data;
     if (notmodified) return;
-    for (let action of actions) {
+    // A status-2/6 callback is not guaranteed to carry an actions array;
+    // without the guard the save is lost to a TypeError.
+    for (let action of actions || []) {
       switch (action.type) {
         case 0:
           // For a secure-share save, write as the share CREATOR (file owner) —
           // the recipient's own uid has no ACL on the creator's node. overrideUid
           // is set by callback() only after the share-token can_edit + node-scope
           // checks pass; a normal desk save passes no overrideUid (action.userid).
-          if (url) await this.importFile(url, key, overrideUid || action.userid);
+          if (url) await this.importFile(url, key, overrideUid || action.userid, filetype);
           break;
         case 1:
           this.debug("New user joining")
@@ -497,7 +606,7 @@ class EurOffice extends Mfs {
     try {
       data = Jwt.verify(this.input.get(Attr.token), eo_secret);
     } catch (jwtError) {
-      this.warn('JWT[154] validation failed:', jwtError.message, eo_secret, token);
+      this.warn('JWT[154] validation failed:', jwtError.message);
       this.exception.unauthorized("Invalid authorization token")
       return
     }
@@ -629,6 +738,129 @@ class EurOffice extends Mfs {
       }
     }
     this.output.data(copied)
+  }
+
+  /**
+   * "Save Copy as…" — the editor hands us the download URL of the copy it just
+   * assembled; create a sibling of the source document and fill it with that
+   * content. v1 keeps the copy in the source's own format (no conversion).
+   */
+  async save_as() {
+    const granted = this.granted_node();
+    const node = await this.db.await_proc('mfs_access_node', this.uid, granted.nid);
+    if (!node || !node.nid) return this.exception.unauthorized('Permission denied');
+    const { hub_id } = node;
+    const pid = node.parent_id || node.pid;
+
+    const srcUrl = String(this.input.need(Attr.url));
+    const title = String(this.input.need('title') || '').trim();
+    const ext = String(node.ext || '').toLowerCase();
+    const fileType = String(this.input.use('file_type', ext) || ext).toLowerCase();
+    if (!/^[a-z0-9]{1,8}$/.test(fileType)) return this.exception.user('UNSUPPORTED_FORMAT');
+
+    // The only host this service will ever fetch is the document server itself.
+    let parsed = null;
+    try { parsed = new URL(srcUrl); } catch (e) { /* refused below */ }
+    const dsBase = Cache.getSysConf('eurofficeServerUrl');
+    if (!parsed || !dsBase || parsed.origin !== new URL(dsBase).origin) {
+      this.warn('[euroffice.save_as] refused a url outside the document server');
+      return this.exception.unauthorized('Permission denied');
+    }
+    if (!title || /[\/\\]/.test(title) || /^\.+$/.test(title)) {
+      return this.exception.user('INVALID_FILENAME');
+    }
+
+    // A sibling copy of the source node — same recipe as new_doc's template copy.
+    const data = await this.db.await_proc('mfs_copy_all', [{ hub_id, nid: node.nid }], this.uid, pid, hub_id);
+    let copied = null;
+    for (let n of data) {
+      switch (n.action) {
+        case 'copy':
+          try {
+            copy_node({ nid: n.nid, mfs_root: n.src_mfs_root }, { nid: n.des_id, mfs_root: n.des_mfs_root }, 0);
+          } catch (e) {
+            this.warn('COPY FAILED ', e);
+          }
+          break;
+        case 'show':
+          copied = await this.db.await_proc('mfs_access_node', this.uid, n.nid);
+          break;
+      }
+    }
+    if (!copied || !copied.nid) return this.exception.user('COPY_FAILED');
+
+    // Name the copy as asked (the proc de-duplicates), then overwrite its
+    // content with the state the editor handed us — the importFile steps. The
+    // copy takes the CHOSEN output format (Save Copy as… may pick xlsx/ods/pdf/…
+    // from a legacy .xls), so its stored file and extension follow file_type,
+    // never the source's.
+    let base = title;
+    for (const suffix of [`.${fileType}`, `.${ext}`]) {
+      if (base.toLowerCase().endsWith(suffix)) {
+        base = base.slice(0, -suffix.length).trim() || title;
+        break;
+      }
+    }
+    await this.db.await_proc('mfs_rename', copied.nid, base);
+    copied = await this.db.await_proc('mfs_access_node', this.uid, copied.nid);
+
+    const outfile = resolve(copied.home_dir, copied.nid, `orig.${fileType}`);
+    const res = await Network.request({ method: 'GET', outfile, url: srcUrl });
+    copied = await this.db.await_proc('mfs_access_node', this.uid, copied.nid);
+    if (isString(copied.metadata)) copied.metadata = JSON.parse(copied.metadata);
+    copied.metadata = copied.metadata || {};
+    delete copied.metadata._seen_;
+    if (fileType !== String(copied.ext || '').toLowerCase()) {
+      // mfs_copy_all cloned the SOURCE file (orig.<srcExt>); drop it and move
+      // the copy onto the chosen format.
+      try { unlinkSync(resolve(copied.home_dir, copied.nid, `orig.${copied.ext}`)); } catch (e) { /* none */ }
+      if (isString(copied.mimetype) && copied.mimetype.includes('/')) {
+        copied.mimetype = `${copied.mimetype.split('/')[0]}/${fileType}`;
+      }
+      copied.extension = fileType;
+      copied.ext = fileType;
+    }
+    copied.publish_time = Math.floor(res.mtimeMs / 1000);
+    copied.metadata.md5Hash = res.md5Hash;
+    copied.md5Hash = res.md5Hash;
+    copied.filesize = res.size;
+    copied.mtime = copied.publish_time;
+    await this.db.await_proc('mfs_set_node_attr', copied.id, copied, 0);
+    await this.db.await_proc('mfs_set_metadata', copied.id, { md5Hash: res.md5Hash }, 0);
+    Document.rebuildInfo(copied, this.uid, this.input.get(Attr.socket_id));
+    await this.sendNodeAttributes(copied, 'media.new');
+    this.output.data(copied);
+  }
+
+  /**
+   * Mirror a rename into the LIVE editing session (Command Service `meta`), so
+   * every open editor retitles without a reopen. The storage rename itself is
+   * media.rename — this endpoint only tells the document server about it.
+   */
+  async retitle() {
+    const granted = this.granted_node();
+    const key = String(this.input.need('key'));
+    const title = String(this.input.need('title') || '').trim();
+    // The key must denote the very node this session was granted on — no
+    // cross-document meta pushes.
+    const [kHub, kNid] = key.split('.');
+    if (kHub !== granted.hub_id || kNid !== granted.nid) {
+      return this.exception.unauthorized('Permission denied');
+    }
+    if (!title) return this.exception.user('INVALID_FILENAME');
+    let reply = null;
+    try {
+      reply = await sendDsCommand(
+        Cache.getSysConf('eurofficeServerUrl'),
+        { c: 'meta', key, meta: { title } },
+        eo_secret
+      );
+    } catch (e) {
+      // Harmless degradation: the file IS renamed; open editors just keep the
+      // old title until they reopen.
+      this.warn('[euroffice.retitle] command service unreachable:', e && e.message);
+    }
+    this.output.data({ error: reply ? reply.error : -1 });
   }
 
 }
