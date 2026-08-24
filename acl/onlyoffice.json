@@ -20,7 +20,7 @@
       },
       "returns": {
         "type": "octet/stream",
-        "doc": "Render the templates/index.html with data required by the onlyoffice document server."
+        "doc": "Render templates/editor.html with the data required by the document server."
       },
       "errors": [
         {
