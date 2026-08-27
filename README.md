@@ -27,8 +27,8 @@ npm run deploy              # build and deploy
 npm run remove-plugin       # unregister
 ```
 
-To get a runtime to develop against, use the
-[Starter Kit](https://github.com/drumee/starter-kit).
+To get a runtime to develop against, follow the
+[getting-started guides](https://docs.drumee.com/getting-started).
 
 ## Built on
 
