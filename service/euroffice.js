@@ -24,6 +24,47 @@ const {
   ORIGINAL,
 } = Constants;
 
+// euroffice.assets: which editor pages the desk should warm in the background.
+const EDITOR_APPS = { word: 'documenteditor', cell: 'spreadsheeteditor', slide: 'presentationeditor' };
+const ASSETS_TTL_MS = 10 * 60 * 1000;
+let _assetsCache = { server: null, version: null, time: 0 };
+
+/**
+ * The versioned path segment (e.g. 9.2.1-70ff7e4b...) the running document
+ * server puts in front of every asset URL. Scraped from api.js, the same file
+ * the real editor page loads, and remembered for ASSETS_TTL_MS so a docserver
+ * upgrade is picked up within that window. A previous good value survives a
+ * transient fetch failure.
+ * @param {string} server docserver origin
+ * @param {Function} [warn]
+ * @returns {Promise<string|null>}
+ */
+async function docserverVersion(server, warn) {
+  const now = Date.now();
+  if (_assetsCache.server === server && now - _assetsCache.time < ASSETS_TTL_MS) {
+    return _assetsCache.version;
+  }
+  let version = null;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 5000);
+    const res = await fetch(`${server}/web-apps/apps/api/documents/api.js`, { signal: ctl.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const m = (await res.text()).match(/\b(\d+\.\d+\.\d+-[0-9a-f]{6,})\b/);
+      if (m) version = m[1];
+    }
+  } catch (e) {
+    if (warn) warn(`euroffice.assets: cannot read api.js from ${server}: ${e && e.message}`);
+  }
+  if (version || _assetsCache.server !== server) {
+    _assetsCache = { server, version, time: now };
+  } else {
+    _assetsCache.time = now;
+  }
+  return _assetsCache.version;
+}
+
 
 class EurOffice extends Mfs {
 
@@ -334,6 +375,28 @@ class EurOffice extends Mfs {
 
     await this.html(src)
     
+  }
+
+  /**
+   * Where the editor's static bundle lives, for the desk's background warm-up
+   * (ui-team libs/office-warmup.js). The editor runs in an iframe on the
+   * document-server origin and the browser keys its cache by that frame, so
+   * the only way to warm what the editor will read is to load the editor page
+   * itself, on that origin, under the versioned path. This hands back the
+   * origin and that version. Nothing is opened on the docserver.
+   */
+  async assets() {
+    const server = String(Cache.getSysConf('eurofficeServerUrl') || '').replace(/\/+$/, '');
+    if (!server) {
+      return this.output.data({ server: null, version: null, editors: {}, ttl: ASSETS_TTL_MS });
+    }
+    const version = await docserverVersion(server, (m) => this.warn(m));
+    const base = version ? `${server}/${version}` : server;
+    const editors = {};
+    for (const [kind, app] of Object.entries(EDITOR_APPS)) {
+      editors[kind] = `${base}/web-apps/apps/${app}/main/index.html`;
+    }
+    this.output.data({ server, version, editors, ttl: ASSETS_TTL_MS });
   }
   /**
    * 

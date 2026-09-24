@@ -61,6 +61,38 @@
         }
       ]
     },
+    "assets": {
+      "doc": "Where the document-server editor bundle lives (origin, version hash, per-editor page URL) so the desk can warm the browser cache in the background before the first document is opened. Read-only, no docserver session is created.",
+      "scope": "hub",
+      "permission": {
+        "src": "read"
+      },
+      "params": {
+        "hub_id": {
+          "type": "string",
+          "required": true,
+          "doc": "Hub id (session context)."
+        }
+      },
+      "returns": {
+        "server": {
+          "type": "string",
+          "doc": "Document-server origin, e.g. https://euroffice.drumee.io"
+        },
+        "version": {
+          "type": "string",
+          "doc": "Versioned path segment the docserver serves its assets under; null when api.js could not be read."
+        },
+        "editors": {
+          "type": "object",
+          "doc": "word / cell / slide: absolute URL of each editor page under the versioned path."
+        },
+        "ttl": {
+          "type": "number",
+          "doc": "How long the server caches the version lookup, in milliseconds."
+        }
+      }
+    },
     "read": {
       "doc": "Send requested file content. Permission intentionally set to anonymous because it's sent by third party. The permission control relies on the the method onlyoffice.html",
       "scope": "hub",
