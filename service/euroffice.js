@@ -26,6 +26,11 @@ const {
 
 // euroffice.assets: which editor pages the desk should warm in the background.
 const EDITOR_APPS = { word: 'documenteditor', cell: 'spreadsheeteditor', slide: 'presentationeditor' };
+// Blank templates under the `doc_templates` folder (same names the New menu
+// passes to new_doc). The desk warm-up opens them read-only through `preload`
+// so the browser caches the editor AND its default font set before the first
+// real document.
+const WARMUP_TEMPLATES = { word: 'document.docx', cell: 'spreadsheet.xlsx', slide: 'Presentation.pptx' };
 const ASSETS_TTL_MS = 10 * 60 * 1000;
 let _assetsCache = { server: null, version: null, time: 0 };
 
@@ -366,15 +371,19 @@ class EurOffice extends Mfs {
    * 
    */
   async preload() {
-    const uid = this.uid;
-    const name = this.input.need(Attr.name);
+    const name = String(this.input.need(Attr.name));
 
     let { db_name, path } = JSON.parse(Cache.getSysConf('doc_templates'));
     let filepath = join(path, name);
     let src = await this.yp.await_proc(`${db_name}.mfs_access_node`, this.uid, filepath)
+    if (!src || !src.id) return this.exception.unauthorized('Permission denied');
+    // Always a viewer: this page exists to warm the browser cache (desk
+    // warm-up, hidden iframe). A template is shared by everyone, and a hidden
+    // frame must never hold an edit session on it, whatever the caller's
+    // privilege on the templates hub.
+    src = { ...src, privilege: Number(src.privilege || 0) & ~PERMISSION_WRITE };
 
     await this.html(src)
-    
   }
 
   /**
@@ -396,7 +405,7 @@ class EurOffice extends Mfs {
     for (const [kind, app] of Object.entries(EDITOR_APPS)) {
       editors[kind] = `${base}/web-apps/apps/${app}/main/index.html`;
     }
-    this.output.data({ server, version, editors, ttl: ASSETS_TTL_MS });
+    this.output.data({ server, version, editors, templates: { ...WARMUP_TEMPLATES }, ttl: ASSETS_TTL_MS });
   }
   /**
    * 
