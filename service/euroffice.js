@@ -24,6 +24,52 @@ const {
   ORIGINAL,
 } = Constants;
 
+// euroffice.assets: which editor pages the desk should warm in the background.
+const EDITOR_APPS = { word: 'documenteditor', cell: 'spreadsheeteditor', slide: 'presentationeditor' };
+// Blank templates under the `doc_templates` folder (same names the New menu
+// passes to new_doc). The desk warm-up opens them read-only through `preload`
+// so the browser caches the editor AND its default font set before the first
+// real document.
+const WARMUP_TEMPLATES = { word: 'document.docx', cell: 'spreadsheet.xlsx', slide: 'Presentation.pptx' };
+const ASSETS_TTL_MS = 10 * 60 * 1000;
+let _assetsCache = { server: null, version: null, time: 0 };
+
+/**
+ * The versioned path segment (e.g. 9.2.1-70ff7e4b...) the running document
+ * server puts in front of every asset URL. Scraped from api.js, the same file
+ * the real editor page loads, and remembered for ASSETS_TTL_MS so a docserver
+ * upgrade is picked up within that window. A previous good value survives a
+ * transient fetch failure.
+ * @param {string} server docserver origin
+ * @param {Function} [warn]
+ * @returns {Promise<string|null>}
+ */
+async function docserverVersion(server, warn) {
+  const now = Date.now();
+  if (_assetsCache.server === server && now - _assetsCache.time < ASSETS_TTL_MS) {
+    return _assetsCache.version;
+  }
+  let version = null;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 5000);
+    const res = await fetch(`${server}/web-apps/apps/api/documents/api.js`, { signal: ctl.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const m = (await res.text()).match(/\b(\d+\.\d+\.\d+-[0-9a-f]{6,})\b/);
+      if (m) version = m[1];
+    }
+  } catch (e) {
+    if (warn) warn(`euroffice.assets: cannot read api.js from ${server}: ${e && e.message}`);
+  }
+  if (version || _assetsCache.server !== server) {
+    _assetsCache = { server, version, time: now };
+  } else {
+    _assetsCache.time = now;
+  }
+  return _assetsCache.version;
+}
+
 
 class EurOffice extends Mfs {
 
@@ -325,15 +371,41 @@ class EurOffice extends Mfs {
    * 
    */
   async preload() {
-    const uid = this.uid;
-    const name = this.input.need(Attr.name);
+    const name = String(this.input.need(Attr.name));
 
     let { db_name, path } = JSON.parse(Cache.getSysConf('doc_templates'));
     let filepath = join(path, name);
     let src = await this.yp.await_proc(`${db_name}.mfs_access_node`, this.uid, filepath)
+    if (!src || !src.id) return this.exception.unauthorized('Permission denied');
+    // Always a viewer: this page exists to warm the browser cache (desk
+    // warm-up, hidden iframe). A template is shared by everyone, and a hidden
+    // frame must never hold an edit session on it, whatever the caller's
+    // privilege on the templates hub.
+    src = { ...src, privilege: Number(src.privilege || 0) & ~PERMISSION_WRITE };
 
     await this.html(src)
-    
+  }
+
+  /**
+   * Where the editor's static bundle lives, for the desk's background warm-up
+   * (ui-team libs/office-warmup.js). The editor runs in an iframe on the
+   * document-server origin and the browser keys its cache by that frame, so
+   * the only way to warm what the editor will read is to load the editor page
+   * itself, on that origin, under the versioned path. This hands back the
+   * origin and that version. Nothing is opened on the docserver.
+   */
+  async assets() {
+    const server = String(Cache.getSysConf('eurofficeServerUrl') || '').replace(/\/+$/, '');
+    if (!server) {
+      return this.output.data({ server: null, version: null, editors: {}, ttl: ASSETS_TTL_MS });
+    }
+    const version = await docserverVersion(server, (m) => this.warn(m));
+    const base = version ? `${server}/${version}` : server;
+    const editors = {};
+    for (const [kind, app] of Object.entries(EDITOR_APPS)) {
+      editors[kind] = `${base}/web-apps/apps/${app}/main/index.html`;
+    }
+    this.output.data({ server, version, editors, templates: { ...WARMUP_TEMPLATES }, ttl: ASSETS_TTL_MS });
   }
   /**
    * 
