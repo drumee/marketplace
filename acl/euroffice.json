@@ -32,21 +32,31 @@
       ]
     },
     "preload": {
-      "doc": "Send a html page with template content to force frontend to cache ",
+      "doc": "Render the editor page for one of the blank templates under doc_templates, always read-only. Loaded by the desk in a hidden iframe to warm the browser cache (editor bundle + default fonts) before the first real document.",
       "scope": "hub",
       "permission": {
         "src": "read"
       },
       "params": {
-        "nid": {
+        "name": {
           "type": "string",
           "required": true,
-          "doc": "File node id."
+          "doc": "Template file name inside the doc_templates folder, e.g. spreadsheet.xlsx"
         },
         "hub_id": {
           "type": "string",
           "required": true,
-          "doc": "File hub id."
+          "doc": "Hub id (session context)."
+        },
+        "lang": {
+          "type": "string",
+          "required": false,
+          "doc": "Editor UI language."
+        },
+        "theme": {
+          "type": "string",
+          "required": false,
+          "doc": "light or dark."
         }
       },
       "returns": {
@@ -60,6 +70,42 @@
           "http_status": 401
         }
       ]
+    },
+    "assets": {
+      "doc": "Where the document-server editor bundle lives (origin, version hash, per-editor page URL) so the desk can warm the browser cache in the background before the first document is opened. Read-only, no docserver session is created.",
+      "scope": "hub",
+      "permission": {
+        "src": "read"
+      },
+      "params": {
+        "hub_id": {
+          "type": "string",
+          "required": true,
+          "doc": "Hub id (session context)."
+        }
+      },
+      "returns": {
+        "server": {
+          "type": "string",
+          "doc": "Document-server origin, e.g. https://euroffice.drumee.io"
+        },
+        "version": {
+          "type": "string",
+          "doc": "Versioned path segment the docserver serves its assets under; null when api.js could not be read."
+        },
+        "editors": {
+          "type": "object",
+          "doc": "word / cell / slide: absolute URL of each editor page under the versioned path."
+        },
+        "ttl": {
+          "type": "number",
+          "doc": "How long the server caches the version lookup, in milliseconds."
+        },
+        "templates": {
+          "type": "object",
+          "doc": "word / cell / slide: template file name to pass to preload for the warm-up."
+        }
+      }
     },
     "read": {
       "doc": "Send requested file content. Permission intentionally set to anonymous because it's sent by third party. The permission control relies on the the method onlyoffice.html",
