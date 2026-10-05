@@ -17,6 +17,7 @@ const { unlinkSync, renameSync, openSync, readSync, closeSync } = require('fs');
 const { WRITE: PERMISSION_WRITE } = require("./lib/permission-bits");
 const { buildEditorConfig } = require("./lib/editor-config");
 const { renderEditorPage } = require("./lib/editor-page");
+const { editorSource, ensureFitted } = require("./lib/fitted-source");
 const { sendDsCommand } = require("./lib/ds-command");
 const { convertDocument } = require("./lib/ds-convert");
 const { EurOffice: eo_secret, drumee: drumee_secret } = readFileSync(keyPath);
@@ -296,8 +297,14 @@ class EurOffice extends Mfs {
         { expiresIn: '12h' }
       );
     }
+    // A table wider than the page is cut at its edge: hand the editor the
+    // page-fitted copy, built now if this is the first open (see lib/fitted-source).
+    const _fitted = await ensureFitted({ ..._node, extension, ext: extension });
     // The session key is used by only office unique id for colaboration.
-    const sessionKey = `${hub_id}.${nid}.${mtime}`;
+    // `.f` marks a session fed from the fitted copy: the document server caches
+    // content per key, so the key must change when the source does, or a session
+    // opened before the copy existed keeps serving the cut original.
+    const sessionKey = `${hub_id}.${nid}.${mtime}${_fitted ? '.f' : ''}`;
 
     // Sign the sessionKey to ensure with wonn't be forged. Use the OWNER uid (creator
     // for a share request) so euroffice.read resolves the content as the file owner.
@@ -531,7 +538,9 @@ class EurOffice extends Mfs {
       }
       let { node } = await this.getNode(sessionKey, uid, Permission.read)
       if (node) {
-        await this.send_media(node, ORIGINAL);
+        // The page-fitted copy when one is current, so a table wider than the
+        // page reaches the editor whole. See lib/fitted-source.
+        await this.send_media(editorSource(node), ORIGINAL);
       }
     } catch (jwtError) {
       this.warn('JWT[154] validation failed:', jwtError.message);
