@@ -35,6 +35,35 @@ const WARMUP_TEMPLATES = { word: 'document.docx', cell: 'spreadsheet.xlsx', slid
 const ASSETS_TTL_MS = 10 * 60 * 1000;
 let _assetsCache = { server: null, version: null, time: 0 };
 
+// The document server runs one editing session per key, and html() builds the
+// key from the file's mtime. A Save press (status 6) writes the file and moves
+// its mtime while the session is still open, so the next user to open it would
+// get a new key and a second session: two copies edited apart, the last one
+// closed overwriting the other. While a session is open, its key is pinned here
+// and html() hands it to newcomers. Dropped when the session ends (status 2/4);
+// the TTL bounds a session whose closing callback never came.
+const LIVE_KEY_TTL = 24 * 3600;
+const liveKeyName = (hub_id, nid) => `eo:live:${hub_id}.${nid}`;
+
+/**
+ * The fields a content write changed, for mfs_set_node_attr. The node comes from
+ * mfs_access_node, whose file_path carries the workspace name in front (it is
+ * the path as the desk shows it): written back whole, that name was stacked onto
+ * the stored path at every save. When the extension changed, the stored path
+ * (ownpath) follows it.
+ */
+const savedAttr = (node, extChanged) => {
+  const attr = { publish_time: node.publish_time, filesize: node.filesize };
+  if (extChanged) {
+    attr.extension = node.extension;
+    attr.mimetype = node.mimetype;
+    if (isString(node.ownpath) && /\.[^./]*$/.test(node.ownpath)) {
+      attr.file_path = node.ownpath.replace(/\.[^./]*$/, `.${node.extension}`);
+    }
+  }
+  return attr;
+};
+
 /**
  * The versioned path segment (e.g. 9.2.1-70ff7e4b...) the running document
  * server puts in front of every asset URL. Scraped from api.js, the same file
@@ -232,7 +261,7 @@ class EurOffice extends Mfs {
           if (isString(_node.mimetype) && _node.mimetype.includes('/')) {
             _node.mimetype = `${_node.mimetype.split('/')[0]}/${_modernExt}`;
           }
-          await this.yp.await_proc(`${_dbName}.mfs_set_node_attr`, _node.id, _node, 0);
+          await this.yp.await_proc(`${_dbName}.mfs_set_node_attr`, _node.id, savedAttr(_node, true), 0);
           extension = _modernExt;
           this.debug(`[euroffice.html] relabelled mislabelled ${_legacyExt} -> ${_modernExt} for ${nid}`);
           // Skip the document-server conversion below.
@@ -264,7 +293,7 @@ class EurOffice extends Mfs {
           _node.filesize = _res.size;
           _node.publish_time = Math.floor(_res.mtimeMs / 1000);
           _node.mtime = _node.publish_time;
-          await this.yp.await_proc(`${_dbName}.mfs_set_node_attr`, _node.id, _node, 0);
+          await this.yp.await_proc(`${_dbName}.mfs_set_node_attr`, _node.id, savedAttr(_node, true), 0);
           await this.yp.await_proc(`${_dbName}.mfs_set_metadata`, _node.id, { md5Hash: _res.md5Hash }, 0);
           // The editor now opens the native file: refresh the locals the config uses.
           extension = _modernExt;
@@ -304,7 +333,10 @@ class EurOffice extends Mfs {
     // `.f` marks a session fed from the fitted copy: the document server caches
     // content per key, so the key must change when the source does, or a session
     // opened before the copy existed keeps serving the cut original.
-    const sessionKey = `${hub_id}.${nid}.${mtime}${_fitted ? '.f' : ''}`;
+    // A session already open on this file keeps its key, even when the file's
+    // mtime has moved since (see LIVE_KEY_TTL): the newcomer joins it.
+    const _live = await this.liveKey(hub_id, nid);
+    const sessionKey = _live || `${hub_id}.${nid}.${mtime}${_fitted ? '.f' : ''}`;
 
     // Sign the sessionKey to ensure with wonn't be forged. Use the OWNER uid (creator
     // for a share request) so euroffice.read resolves the content as the file owner.
@@ -496,6 +528,41 @@ class EurOffice extends Mfs {
   }
 
   /**
+   * The key of the editing session open on this file, if any (see LIVE_KEY_TTL).
+   */
+  async liveKey(hub_id, nid) {
+    try {
+      const c = RedisStore.getClient();
+      const key = c ? await c.get(liveKeyName(hub_id, nid)) : null;
+      return key && key.startsWith(`${hub_id}.${nid}.`) ? key : null;
+    } catch (e) {
+      this.warn('[euroffice] live key read failed:', e && e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Pin (on) or drop the key of the session a callback reports on.
+   */
+  async pinLiveKey(key, on) {
+    const [hub_id, nid] = String(key || '').split('.');
+    if (!hub_id || !nid) return;
+    try {
+      const c = RedisStore.getClient();
+      if (!c) return;
+      const name = liveKeyName(hub_id, nid);
+      if (on) {
+        await c.set(name, key, { EX: LIVE_KEY_TTL });
+      } else if ((await c.get(name)) === key) {
+        // Only the session that ended: a later one may have pinned its own.
+        await c.del(name);
+      }
+    } catch (e) {
+      this.warn('[euroffice] live key update failed:', e && e.message);
+    }
+  }
+
+  /**
    * 
    */
   async getNode(sessionKey, uid, permission) {
@@ -570,7 +637,7 @@ class EurOffice extends Mfs {
   * @param {*} dir
   * @param {*} filter
   */
-  async importFile(url, sessionKey, uid, savedType) {
+  async importFile(url, sessionKey, uid, savedType, author) {
     // NULL-GUARD before destructuring: getNode returns null when the uid lacks write
     // on the node (e.g. a recipient's own uid) → destructuring null would crash the
     // callback (was the euroffice.callback TypeError). The share save passes the
@@ -624,11 +691,15 @@ class EurOffice extends Mfs {
     }
     node.publish_time = Math.floor(res.mtimeMs / 1000);
     node.metadata.md5Hash = md5Hash;
+    // Who made this version, for the Details card ("Modified by"): the author of
+    // the last change, not the share creator a secure-share save writes as.
+    const modified_by = author || uid;
+    node.metadata.modified_by = modified_by;
     node.md5Hash = md5Hash;
     node.filesize = res.size;
     node.mtime = node.publish_time;
-    await this.yp.await_proc(`${db_name}.mfs_set_node_attr`, node.id, node, 0);
-    await this.yp.await_proc(`${db_name}.mfs_set_metadata`, node.id, { md5Hash }, 0);
+    await this.yp.await_proc(`${db_name}.mfs_set_node_attr`, node.id, savedAttr(node, _promoted), 0);
+    await this.yp.await_proc(`${db_name}.mfs_set_metadata`, node.id, { md5Hash, modified_by }, 0);
     Document.rebuildInfo(
       node,
       uid,
@@ -655,25 +726,28 @@ class EurOffice extends Mfs {
    * 
    */
   async handleClosure(data, overrideUid) {
-    const { actions, notmodified, history, key, url, filetype } = data;
-    if (notmodified) return;
-    // A status-2/6 callback is not guaranteed to carry an actions array;
-    // without the guard the save is lost to a TypeError.
-    for (let action of actions || []) {
-      switch (action.type) {
-        case 0:
-          // For a secure-share save, write as the share CREATOR (file owner) —
-          // the recipient's own uid has no ACL on the creator's node. overrideUid
-          // is set by callback() only after the share-token can_edit + node-scope
-          // checks pass; a normal desk save passes no overrideUid (action.userid).
-          if (url) await this.importFile(url, key, overrideUid || action.userid, filetype);
-          break;
-        case 1:
-          this.debug("New user joining")
-          break;
-        case 2:
-      }
-    }
+    const { actions, notmodified, users, history, key, url, filetype } = data;
+    // notmodified: nothing changed since the last save. That is the closing
+    // status 2 after a Save-button force save, whose bytes came with status 6.
+    if (notmodified || !url) return;
+    // Who saved: the user who left (type 0, status 2) or who pressed Save (type 2,
+    // status 6). Type 2 used to be skipped, so a Save press was dropped and the
+    // closing callback then came as notmodified: the edit never reached the file.
+    // A status-2/6 callback is not guaranteed to carry an actions array; fall
+    // back to its users list.
+    const saved = toArray(actions).find((a) => a && (a.type === 0 || a.type === 2));
+    const saver = (saved && saved.userid) || toArray(users)[0];
+    // The last change's author can differ from the saver: the last one to leave
+    // a co-editing session may only have been reading.
+    const changes = toArray(history && history.changes);
+    const last = changes[changes.length - 1];
+    const author = (last && last.user && last.user.id) || saver;
+    // For a secure-share save, write as the share CREATOR (file owner): the
+    // recipient's own uid has no ACL on the creator's node. overrideUid is set by
+    // callback() only after the share-token can_edit + node-scope checks pass; a
+    // normal desk save passes no overrideUid.
+    const uid = overrideUid || saver;
+    if (uid) await this.importFile(url, key, uid, filetype, author);
   }
 
   /**
@@ -691,6 +765,9 @@ class EurOffice extends Mfs {
       this.exception.unauthorized("Invalid authorization token")
       return
     }
+    // Pin the session key while the session is open, drop it once it has ended.
+    if (data.status === 1 || data.status === 6) await this.pinLiveKey(data.key, true);
+    if (data.status === 2 || data.status === 4) await this.pinLiveKey(data.key, false);
     // Secure-share recipient SAVE gating. The callback is an anonymous doc-server
     // call, so it can't look up the recipient's per-recipient grant — instead it
     // verifies the tamper-proof decision token (cdt) html signed (eo_secret): a save
@@ -891,7 +968,8 @@ class EurOffice extends Mfs {
     if (isString(copied.metadata)) copied.metadata = JSON.parse(copied.metadata);
     copied.metadata = copied.metadata || {};
     delete copied.metadata._seen_;
-    if (fileType !== String(copied.ext || '').toLowerCase()) {
+    const _extChanged = fileType !== String(copied.ext || '').toLowerCase();
+    if (_extChanged) {
       // mfs_copy_all cloned the SOURCE file (orig.<srcExt>); drop it and move
       // the copy onto the chosen format.
       try { unlinkSync(resolve(copied.home_dir, copied.nid, `orig.${copied.ext}`)); } catch (e) { /* none */ }
@@ -906,7 +984,7 @@ class EurOffice extends Mfs {
     copied.md5Hash = res.md5Hash;
     copied.filesize = res.size;
     copied.mtime = copied.publish_time;
-    await this.db.await_proc('mfs_set_node_attr', copied.id, copied, 0);
+    await this.db.await_proc('mfs_set_node_attr', copied.id, savedAttr(copied, _extChanged), 0);
     await this.db.await_proc('mfs_set_metadata', copied.id, { md5Hash: res.md5Hash }, 0);
     Document.rebuildInfo(copied, this.uid, this.input.get(Attr.socket_id));
     await this.sendNodeAttributes(copied, 'media.new');
