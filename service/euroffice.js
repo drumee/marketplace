@@ -44,6 +44,8 @@ let _assetsCache = { server: null, version: null, time: 0 };
 // the TTL bounds a session whose closing callback never came.
 const LIVE_KEY_TTL = 24 * 3600;
 const liveKeyName = (hub_id, nid) => `eo:live:${hub_id}.${nid}`;
+// How long flush holds its reply for the save it asked for (see flush).
+const FLUSH_SAVE_WAIT_MS = 4000;
 
 /**
  * The fields a content write changed, for mfs_set_node_attr. The node comes from
@@ -726,22 +728,25 @@ class EurOffice extends Mfs {
    * 
    */
   async handleClosure(data, overrideUid) {
-    const { actions, notmodified, users, history, key, url, filetype } = data;
+    const { actions, notmodified, users, history, key, url, filetype, userdata } = data;
     // notmodified: nothing changed since the last save. That is the closing
-    // status 2 after a Save-button force save, whose bytes came with status 6.
+    // status 2 after a force save (Save button or flush), whose bytes came with
+    // status 6.
     if (notmodified || !url) return;
-    // Who saved: the user who left (type 0, status 2) or who pressed Save (type 2,
-    // status 6). Type 2 used to be skipped, so a Save press was dropped and the
-    // closing callback then came as notmodified: the edit never reached the file.
-    // A status-2/6 callback is not guaranteed to carry an actions array; fall
-    // back to its users list.
-    const saved = toArray(actions).find((a) => a && (a.type === 0 || a.type === 2));
-    const saver = (saved && saved.userid) || toArray(users)[0];
     // The last change's author can differ from the saver: the last one to leave
     // a co-editing session may only have been reading.
     const changes = toArray(history && history.changes);
     const last = changes[changes.length - 1];
-    const author = (last && last.user && last.user.id) || saver;
+    const lastAuthor = last && last.user && last.user.id;
+    // Who saved: the user who left (type 0, status 2), who pressed Save (type 2,
+    // status 6) or who closed the window (flush, named in userdata). Type 2 used
+    // to be skipped, so a Save press was dropped and the closing callback then
+    // came as notmodified: the edit never reached the file. A status-2/6 callback
+    // is not guaranteed to carry an actions array, and a flushed session may have
+    // no user left in it.
+    const saved = toArray(actions).find((a) => a && (a.type === 0 || a.type === 2));
+    const saver = (saved && saved.userid) || userdata || toArray(users)[0] || lastAuthor;
+    const author = lastAuthor || saver;
     // For a secure-share save, write as the share CREATOR (file owner): the
     // recipient's own uid has no ACL on the creator's node. overrideUid is set by
     // callback() only after the share-token can_edit + node-scope checks pass; a
@@ -996,6 +1001,53 @@ class EurOffice extends Mfs {
    * every open editor retitles without a reopen. The storage rename itself is
    * media.rename — this endpoint only tells the document server about it.
    */
+  /**
+   * Save the session open on this file now (Command Service `forcesave`). The
+   * editor window calls it as it closes: the document server otherwise waits
+   * savetimeoutdelay (5 s) after the last user leaves before it hands the file
+   * back, so Get info opened right after closing showed the old version. The
+   * window keeps its editor connected until this returns, because the save is
+   * taken from a session that is still open. userdata names the user for the
+   * status 6 callback, which may come after they have left.
+   */
+  async flush() {
+    const granted = this.granted_node();
+    const key = await this.liveKey(granted.hub_id, granted.nid);
+    if (!key) return this.output.data({ error: 1 });
+    let reply = null;
+    try {
+      reply = await sendDsCommand(
+        Cache.getSysConf('eurofficeServerUrl'),
+        { c: 'forcesave', key, userdata: this.uid },
+        eo_secret
+      );
+    } catch (e) {
+      // The save still comes, on the document server's own delay.
+      this.warn('[euroffice.flush] command service unreachable:', e && e.message);
+    }
+    const error = reply ? reply.error : -1;
+    // 0: the document server is building the file and will call back with
+    // status 6. It drops that save if the session empties first, so the reply
+    // waits for importFile to have written it: the window keeps its editor
+    // connected until then.
+    if (error === 0) await this.savedSince(granted);
+    this.output.data({ error });
+  }
+
+  /**
+   * Wait (up to FLUSH_SAVE_WAIT_MS) until the node's content has changed from
+   * `before`, i.e. a save has been imported.
+   */
+  async savedSince(before) {
+    const until = Date.now() + FLUSH_SAVE_WAIT_MS;
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 150));
+      const n = await this.db.await_proc('mfs_access_node', this.uid, before.nid);
+      if (n && (n.md5Hash !== before.md5Hash || Number(n.mtime) > Number(before.mtime))) return true;
+    }
+    return false;
+  }
+
   async retitle() {
     const granted = this.granted_node();
     const key = String(this.input.need('key'));
