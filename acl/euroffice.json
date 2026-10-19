@@ -223,6 +223,25 @@
           "doc": "New display title, extension included."
         }
       }
+    },
+    "flush": {
+      "doc": "Save the open editing session now (Command Service forcesave). Called by the editor window as it closes, so the file is back in seconds instead of after the document server's post-close delay.",
+      "scope": "hub",
+      "permission": {
+        "src": "write"
+      },
+      "params": {
+        "nid": {
+          "type": "string",
+          "required": true,
+          "doc": "Document node id."
+        },
+        "hub_id": {
+          "type": "string",
+          "required": true,
+          "doc": "Hub id."
+        }
+      }
     }
   },
   "modules": {
