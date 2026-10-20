@@ -20,6 +20,7 @@ const { renderEditorPage } = require("./lib/editor-page");
 const { editorSource, ensureFitted } = require("./lib/fitted-source");
 const { sendDsCommand } = require("./lib/ds-command");
 const { convertDocument } = require("./lib/ds-convert");
+const { prepareOfficeSave, saveParticipants, notifyOfficeSave } = require("./lib/owner-notify");
 const { EurOffice: eo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
@@ -639,7 +640,7 @@ class EurOffice extends Mfs {
   * @param {*} dir
   * @param {*} filter
   */
-  async importFile(url, sessionKey, uid, savedType, author) {
+  async importFile(url, sessionKey, uid, savedType, author, participants) {
     // NULL-GUARD before destructuring: getNode returns null when the uid lacks write
     // on the node (e.g. a recipient's own uid) → destructuring null would crash the
     // callback (was the euroffice.callback TypeError). The share save passes the
@@ -665,6 +666,17 @@ class EurOffice extends Mfs {
 
     const base = resolve(node.home_dir, node.nid)
     const outfile = resolve(base, `orig.${_outExt || node.ext}`)
+    // Before the download overwrites the stored document: who is to be told,
+    // and the comments it held (the ones the saved bytes add are the news).
+    let _ownerNotice = null;
+    if (participants) {
+      try {
+        _ownerNotice = await prepareOfficeSave(this, {
+          hub_id: node.hub_id, nid: node.id || node.nid,
+          file: resolve(base, `orig.${_srcExt}`), ext: _srcExt, editors: participants,
+        });
+      } catch (e) { /* nobody is told */ }
+    }
     this.debug(`Downloading ${this.input.get(Attr.url)} => ${outfile}.`);
     let opt = {
       method: 'GET',
@@ -708,6 +720,17 @@ class EurOffice extends Mfs {
       this.input.get(Attr.socket_id)
     );
     await this.sendNodeAttributes(node)
+    // "<A> edited / commented on <file>" for the document's owner. Not
+    // awaited: the document server is waiting for this callback's answer.
+    if (_ownerNotice) {
+      notifyOfficeSave(this, {
+        hub_id: node.hub_id,
+        nid: node.id || node.nid,
+        file: outfile,
+        ext: _outExt || node.ext,
+        prepared: _ownerNotice,
+      });
+    }
   }
 
   /**
@@ -752,7 +775,10 @@ class EurOffice extends Mfs {
     // callback() only after the share-token can_edit + node-scope checks pass; a
     // normal desk save passes no overrideUid.
     const uid = overrideUid || saver;
-    if (uid) await this.importFile(url, key, uid, filetype, author);
+    // Who the owner is told edited it: the authors of the changes; without a
+    // change history, only a user the callback says acted (left or pressed
+    // Save) -- never `userdata`, the one who merely closed the window.
+    if (uid) await this.importFile(url, key, uid, filetype, author, saveParticipants(data, saved && saved.userid));
   }
 
   /**
