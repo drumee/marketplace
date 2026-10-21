@@ -80,7 +80,7 @@
         body: JSON.stringify(body)
       });
     };
-    var AUTOSAVE_QUIET_MS = 10000;
+    var AUTOSAVE_QUIET_MS = 5000;
     var autosave = { timer: null, dirty: false };
     config.events = {
       // The document server hands us a download URL of the copy it assembled;
