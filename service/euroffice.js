@@ -407,6 +407,7 @@ class EurOffice extends Mfs {
         saveAsUrl: 'euroffice.save_as',
         renameUrl: 'media.rename',
         retitleUrl: 'euroffice.retitle',
+        flushUrl: 'euroffice.flush',
       };
     }
     this.sendHtml(confObject, integration)

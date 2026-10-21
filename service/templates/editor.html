@@ -80,6 +80,8 @@
         body: JSON.stringify(body)
       });
     };
+    var AUTOSAVE_QUIET_MS = 10000;
+    var autosave = { timer: null, dirty: false };
     config.events = {
       // The document server hands us a download URL of the copy it assembled;
       // the service pulls it and creates the file beside the original.
@@ -121,6 +123,23 @@
             });
           })
           .catch(function (err) { console.error('rename failed', err); });
+      },
+      // Save to the file on its own, as Save / Ctrl+S does. Edits and comments
+      // otherwise reach the document server but the file itself is only
+      // written when someone presses Save or the window closes (flush), so a
+      // comment stayed out of the file -- and its owner was not told -- while
+      // the editor was open. true: local changes pending; false: they reached
+      // the document server. A save is asked once things have been quiet for
+      // AUTOSAVE_QUIET_MS; a newer change restarts the wait.
+      onDocumentStateChange: function (e) {
+        clearTimeout(autosave.timer);
+        if (e && e.data) { autosave.dirty = true; return; }
+        if (!autosave.dirty) return;
+        autosave.timer = setTimeout(function () {
+          autosave.dirty = false;
+          post(drumee.flushUrl, { nid: drumee.nid, hub_id: drumee.hub_id })
+            .catch(function (err) { console.error('autosave failed', err); });
+        }, AUTOSAVE_QUIET_MS);
       }
     };
     <% } %>
