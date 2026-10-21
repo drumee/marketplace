@@ -142,7 +142,7 @@ async function notifyOfficeSave(svc, { hub_id, nid, file, ext, prepared }) {
         const actor = m.comments.attributeComment(c, people);
         if (!actor) continue;
         commenters.add(actor);
-        await notifyFileOwner(svc, { event: FILE_COMMENTED, hub_id, nid, actor, comment: c.text, source: 'office' });
+        await notifyFileOwner(svc, { event: FILE_COMMENTED, hub_id, nid, actor, comment: c.text, focus: c.focus, source: 'office' });
       }
     }
     // Adding a comment is itself a change of the document, so whoever only

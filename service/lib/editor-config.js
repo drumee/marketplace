@@ -8,6 +8,15 @@ const { documentTypeOf } = require('./doc-type');
  */
 const EDITOR_LANG = 'en';
 
+// The comment id the editor opens a file on (editorConfig.actionLink, see
+// buildEditorConfig): a docx comment's durableId in hex ("2C3613C7"), or a
+// spreadsheet/presentation comment's {GUID}.
+const COMMENT_GUID_RE = /^(?:[0-9A-Fa-f]{1,8}|\{[0-9A-Fa-f-]{36}\})$/;
+function commentGuidOf(value) {
+  const v = String(value == null ? '' : value).trim();
+  return COMMENT_GUID_RE.test(v) ? v : null;
+}
+
 /**
  * Build the document-server config, ready to be signed.
  *
@@ -24,8 +33,9 @@ const EDITOR_LANG = 'en';
 function buildEditorConfig(opt) {
   const {
     extension, filename, sessionKey, mode, uid, fullname,
-    uiTheme, readUrl, callbackUrl, nid, hub_id, documentServerUrl,
+    uiTheme, readUrl, callbackUrl, nid, hub_id, documentServerUrl, commentGuid,
   } = opt;
+  const openOnComment = commentGuidOf(commentGuid);
 
   // Selects which editor the document server loads, and with it the chrome the
   // user gets: the spreadsheet status bar (sheet tabs and the "+" add-sheet
@@ -65,6 +75,11 @@ function buildEditorConfig(opt) {
       mode,
       lang: EDITOR_LANG,
       callbackUrl,
+      // Opened from "<A> commented on <file>": the editor scrolls to that
+      // comment, selects it and opens it (documented api.js actionLink, the
+      // same link its own @mention mails carry). An id it does not find is
+      // ignored and the file opens as usual.
+      ...(openOnComment ? { actionLink: { action: { type: 'comment', data: openOnComment } } } : {}),
       user: {
         id: uid,
         name: fullname,
@@ -98,4 +113,4 @@ function buildEditorConfig(opt) {
   };
 }
 
-module.exports = { buildEditorConfig, EDITOR_LANG };
+module.exports = { buildEditorConfig, EDITOR_LANG, commentGuidOf };

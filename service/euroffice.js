@@ -373,6 +373,9 @@ class EurOffice extends Mfs {
       nid,
       hub_id,
       documentServerUrl: Cache.getSysConf('eurofficeServerUrl'),
+      // Opened from a comment notification: open ON that comment. Validated
+      // in buildEditorConfig; anything malformed is simply not passed on.
+      commentGuid: this.input.use('comment', null),
     });
 
     // Sign the ENTIRE config as the token
