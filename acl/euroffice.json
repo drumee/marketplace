@@ -240,6 +240,11 @@
           "type": "string",
           "required": true,
           "doc": "Hub id."
+        },
+        "key": {
+          "type": "string",
+          "required": false,
+          "doc": "Editor session key the page was opened with (hub.nid.mtime[.f]). The live session is found without it; with it the save is addressed for sure."
         }
       }
     }
