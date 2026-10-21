@@ -338,7 +338,7 @@ class EurOffice extends Mfs {
     // opened before the copy existed keeps serving the cut original.
     // A session already open on this file keeps its key, even when the file's
     // mtime has moved since (see LIVE_KEY_TTL): the newcomer joins it.
-    const _live = await this.liveKey(hub_id, nid);
+    const _live = await this.joinableKey(hub_id, nid);
     const sessionKey = _live || `${hub_id}.${nid}.${mtime}${_fitted ? '.f' : ''}`;
 
     // Sign the sessionKey to ensure with wonn't be forged. Use the OWNER uid (creator
@@ -570,21 +570,30 @@ class EurOffice extends Mfs {
   }
 
   /**
-   * Drop the pin of a session the document server reports ended (status 2/4),
-   * unless that key is being edited again. A window opened on the same key
-   * during the closing delay of the previous one gets its own session on that
-   * key, and its status 1 arrives before this closing callback: dropping the
-   * pin then hands the next opener a fresh mtime key, two sessions apart, and
-   * leaves flush() with nothing to save by.
+   * The pinned session key, when the document server still has people in it.
+   * A pin can outlive its session for a few seconds: the window that held it
+   * closed, and the closing callback (status 2/4) that drops the pin has not
+   * arrived yet. Handing that key to the next opener puts them into a session
+   * being finalized, and the document server then throws them out with
+   * "Version changed, the page will be reloaded". The Command Service `info`
+   * tells whether the key is live (error 0, users listed); otherwise the pin
+   * is dropped and the opener gets a fresh key. The file is current by then:
+   * flush() returns only once the close-save has been imported.
    */
-  async unpinEndedKey(key) {
+  async joinableKey(hub_id, nid) {
+    const key = await this.liveKey(hub_id, nid);
+    if (!key) return null;
     try {
       const reply = await sendDsCommand(Cache.getSysConf('eurofficeServerUrl'), { c: 'info', key }, eo_secret);
-      if (reply && Number(reply.error) === 0 && toArray(reply.users).length) return;
+      if (reply && Number(reply.error) === 0 && toArray(reply.users).length) return key;
+      if (reply && (Number(reply.error) === 0 || Number(reply.error) === 1)) {
+        await this.pinLiveKey(key, false);
+        return null;
+      }
     } catch (e) {
-      /* command service unreachable: the plain drop below */
+      /* command service unreachable: trust the pin, as before */
     }
-    await this.pinLiveKey(key, false);
+    return key;
   }
 
   /**
@@ -820,7 +829,7 @@ class EurOffice extends Mfs {
     }
     // Pin the session key while the session is open, drop it once it has ended.
     if (data.status === 1 || data.status === 6) await this.pinLiveKey(data.key, true);
-    if (data.status === 2 || data.status === 4) await this.unpinEndedKey(data.key);
+    if (data.status === 2 || data.status === 4) await this.pinLiveKey(data.key, false);
     // Secure-share recipient SAVE gating. The callback is an anonymous doc-server
     // call, so it can't look up the recipient's per-recipient grant — instead it
     // verifies the tamper-proof decision token (cdt) html signed (eo_secret): a save
