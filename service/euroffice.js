@@ -20,7 +20,6 @@ const { renderEditorPage } = require("./lib/editor-page");
 const { editorSource, ensureFitted } = require("./lib/fitted-source");
 const { sendDsCommand } = require("./lib/ds-command");
 const { convertDocument } = require("./lib/ds-convert");
-const { prepareOfficeSave, saveParticipants, notifyOfficeSave } = require("./lib/owner-notify");
 const { EurOffice: eo_secret, drumee: drumee_secret } = readFileSync(keyPath);
 const {
   ORIGINAL,
@@ -338,7 +337,7 @@ class EurOffice extends Mfs {
     // opened before the copy existed keeps serving the cut original.
     // A session already open on this file keeps its key, even when the file's
     // mtime has moved since (see LIVE_KEY_TTL): the newcomer joins it.
-    const _live = await this.joinableKey(hub_id, nid);
+    const _live = await this.liveKey(hub_id, nid);
     const sessionKey = _live || `${hub_id}.${nid}.${mtime}${_fitted ? '.f' : ''}`;
 
     // Sign the sessionKey to ensure with wonn't be forged. Use the OWNER uid (creator
@@ -373,9 +372,6 @@ class EurOffice extends Mfs {
       nid,
       hub_id,
       documentServerUrl: Cache.getSysConf('eurofficeServerUrl'),
-      // Opened from a comment notification: open ON that comment. Validated
-      // in buildEditorConfig; anything malformed is simply not passed on.
-      commentGuid: this.input.use('comment', null),
     });
 
     // Sign the ENTIRE config as the token
@@ -407,7 +403,6 @@ class EurOffice extends Mfs {
         saveAsUrl: 'euroffice.save_as',
         renameUrl: 'media.rename',
         retitleUrl: 'euroffice.retitle',
-        flushUrl: 'euroffice.flush',
       };
     }
     this.sendHtml(confObject, integration)
@@ -570,33 +565,6 @@ class EurOffice extends Mfs {
   }
 
   /**
-   * The pinned session key, when the document server still has people in it.
-   * A pin can outlive its session for a few seconds: the window that held it
-   * closed, and the closing callback (status 2/4) that drops the pin has not
-   * arrived yet. Handing that key to the next opener puts them into a session
-   * being finalized, and the document server then throws them out with
-   * "Version changed, the page will be reloaded". The Command Service `info`
-   * tells whether the key is live (error 0, users listed); otherwise the pin
-   * is dropped and the opener gets a fresh key. The file is current by then:
-   * flush() returns only once the close-save has been imported.
-   */
-  async joinableKey(hub_id, nid) {
-    const key = await this.liveKey(hub_id, nid);
-    if (!key) return null;
-    try {
-      const reply = await sendDsCommand(Cache.getSysConf('eurofficeServerUrl'), { c: 'info', key }, eo_secret);
-      if (reply && Number(reply.error) === 0 && toArray(reply.users).length) return key;
-      if (reply && (Number(reply.error) === 0 || Number(reply.error) === 1)) {
-        await this.pinLiveKey(key, false);
-        return null;
-      }
-    } catch (e) {
-      /* command service unreachable: trust the pin, as before */
-    }
-    return key;
-  }
-
-  /**
    * 
    */
   async getNode(sessionKey, uid, permission) {
@@ -671,7 +639,7 @@ class EurOffice extends Mfs {
   * @param {*} dir
   * @param {*} filter
   */
-  async importFile(url, sessionKey, uid, savedType, author, participants) {
+  async importFile(url, sessionKey, uid, savedType, author) {
     // NULL-GUARD before destructuring: getNode returns null when the uid lacks write
     // on the node (e.g. a recipient's own uid) → destructuring null would crash the
     // callback (was the euroffice.callback TypeError). The share save passes the
@@ -697,17 +665,6 @@ class EurOffice extends Mfs {
 
     const base = resolve(node.home_dir, node.nid)
     const outfile = resolve(base, `orig.${_outExt || node.ext}`)
-    // Before the download overwrites the stored document: who is to be told,
-    // and the comments it held (the ones the saved bytes add are the news).
-    let _ownerNotice = null;
-    if (participants) {
-      try {
-        _ownerNotice = await prepareOfficeSave(this, {
-          hub_id: node.hub_id, nid: node.id || node.nid,
-          file: resolve(base, `orig.${_srcExt}`), ext: _srcExt, editors: participants,
-        });
-      } catch (e) { /* nobody is told */ }
-    }
     this.debug(`Downloading ${this.input.get(Attr.url)} => ${outfile}.`);
     let opt = {
       method: 'GET',
@@ -751,17 +708,6 @@ class EurOffice extends Mfs {
       this.input.get(Attr.socket_id)
     );
     await this.sendNodeAttributes(node)
-    // "<A> edited / commented on <file>" for the document's owner. Not
-    // awaited: the document server is waiting for this callback's answer.
-    if (_ownerNotice) {
-      notifyOfficeSave(this, {
-        hub_id: node.hub_id,
-        nid: node.id || node.nid,
-        file: outfile,
-        ext: _outExt || node.ext,
-        prepared: _ownerNotice,
-      });
-    }
   }
 
   /**
@@ -806,10 +752,7 @@ class EurOffice extends Mfs {
     // callback() only after the share-token can_edit + node-scope checks pass; a
     // normal desk save passes no overrideUid.
     const uid = overrideUid || saver;
-    // Who the owner is told edited it: the authors of the changes; without a
-    // change history, only a user the callback says acted (left or pressed
-    // Save) -- never `userdata`, the one who merely closed the window.
-    if (uid) await this.importFile(url, key, uid, filetype, author, saveParticipants(data, saved && saved.userid));
+    if (uid) await this.importFile(url, key, uid, filetype, author);
   }
 
   /**
@@ -1069,55 +1012,26 @@ class EurOffice extends Mfs {
    */
   async flush() {
     const granted = this.granted_node();
-    const { hub_id, nid } = granted;
-    const prefix = `${hub_id}.${nid}.`;
-    // The session's key, surest source first: the editor page names the key it
-    // was opened with. The Redis pin (see LIVE_KEY_TTL) can be gone - a late
-    // status 2/4 from an earlier window on the same key dropped it while the
-    // next window was already open - so the keys html() builds from the file's
-    // mtime are tried as well, with and without the fitted-copy suffix.
-    const candidates = [];
-    const offer = (k) => {
-      const key = String(k || '');
-      if (key.startsWith(prefix) && !candidates.includes(key)) candidates.push(key);
-    };
-    offer(this.input.use('key', ''));
-    offer(await this.liveKey(hub_id, nid));
-    const mtime = Number(granted.mtime || granted.publish_time || 0);
-    if (mtime) {
-      offer(`${prefix}${mtime}`);
-      offer(`${prefix}${mtime}.f`);
+    const key = await this.liveKey(granted.hub_id, granted.nid);
+    if (!key) return this.output.data({ error: 1 });
+    let reply = null;
+    try {
+      reply = await sendDsCommand(
+        Cache.getSysConf('eurofficeServerUrl'),
+        { c: 'forcesave', key, userdata: this.uid },
+        eo_secret
+      );
+    } catch (e) {
+      // The save still comes, on the document server's own delay.
+      this.warn('[euroffice.flush] command service unreachable:', e && e.message);
     }
-    const dsUrl = Cache.getSysConf('eurofficeServerUrl');
-    for (const key of candidates) {
-      let reply = null;
-      try {
-        reply = await sendDsCommand(dsUrl, { c: 'forcesave', key, userdata: this.uid }, eo_secret);
-      } catch (e) {
-        // The save still comes, on the document server's own delay.
-        this.warn('[euroffice.flush] command service unreachable:', e && e.message);
-        return this.output.data({ error: -1, saved: false, key });
-      }
-      const error = reply ? Number(reply.error) : -1;
-      // 1: no session under this key. Try the next one.
-      if (error === 1) continue;
-      // 4: the session is open and has nothing new to write: the file is current.
-      if (error === 4) {
-        await this.pinLiveKey(key, true);
-        return this.output.data({ error: 0, saved: true, key });
-      }
-      if (error !== 0) return this.output.data({ error, saved: false, key });
-      // 0: the document server is building the file and will call back with
-      // status 6. It drops that save if the session empties first, so the reply
-      // waits for importFile to have written it: the window keeps its editor
-      // connected until then.
-      await this.pinLiveKey(key, true);
-      const saved = await this.savedSince(granted);
-      if (!saved) this.warn(`[euroffice.flush] save of ${nid} (${key}) did not land within ${FLUSH_SAVE_WAIT_MS} ms`);
-      return this.output.data({ error: 0, saved, key });
-    }
-    this.warn(`[euroffice.flush] no editing session found for ${nid} (tried ${candidates.length} keys)`);
-    this.output.data({ error: 1, saved: false });
+    const error = reply ? reply.error : -1;
+    // 0: the document server is building the file and will call back with
+    // status 6. It drops that save if the session empties first, so the reply
+    // waits for importFile to have written it: the window keeps its editor
+    // connected until then.
+    if (error === 0) await this.savedSince(granted);
+    this.output.data({ error });
   }
 
   /**

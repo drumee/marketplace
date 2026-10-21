@@ -72,13 +72,6 @@
     // drops them; the token stays valid) and call back into the same-origin
     // Drumee services with this page's session cookies.
     var drumee = <%= integrationJson %>;
-    // Name the session key to the hosting window: it asks for a save as it
-    // closes (euroffice.flush) and cannot read this frame, and the key is the
-    // surest way to find the session on the document server.
-    try {
-      var hostOrigin = document.referrer ? new URL(document.referrer).origin : '*';
-      window.parent.postMessage({ type: 'drumee-editor-key', nid: drumee.nid, key: drumee.docKey }, hostOrigin);
-    } catch (e) { /* no hosting window */ }
     var post = function (url, body) {
       return fetch(url, {
         method: 'POST',
@@ -87,8 +80,6 @@
         body: JSON.stringify(body)
       });
     };
-    var AUTOSAVE_QUIET_MS = 5000;
-    var autosave = { timer: null, dirty: false };
     config.events = {
       // The document server hands us a download URL of the copy it assembled;
       // the service pulls it and creates the file beside the original.
@@ -130,23 +121,6 @@
             });
           })
           .catch(function (err) { console.error('rename failed', err); });
-      },
-      // Save to the file on its own, as Save / Ctrl+S does. Edits and comments
-      // otherwise reach the document server but the file itself is only
-      // written when someone presses Save or the window closes (flush), so a
-      // comment stayed out of the file -- and its owner was not told -- while
-      // the editor was open. true: local changes pending; false: they reached
-      // the document server. A save is asked once things have been quiet for
-      // AUTOSAVE_QUIET_MS; a newer change restarts the wait.
-      onDocumentStateChange: function (e) {
-        clearTimeout(autosave.timer);
-        if (e && e.data) { autosave.dirty = true; return; }
-        if (!autosave.dirty) return;
-        autosave.timer = setTimeout(function () {
-          autosave.dirty = false;
-          post(drumee.flushUrl, { nid: drumee.nid, hub_id: drumee.hub_id, key: drumee.docKey })
-            .catch(function (err) { console.error('autosave failed', err); });
-        }, AUTOSAVE_QUIET_MS);
       }
     };
     <% } %>
